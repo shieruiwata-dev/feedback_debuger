@@ -1,0 +1,40 @@
+project_id = "feedback-debugger"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+enabled = true
+port = 54323
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://localhost:5173"]
+jwt_expiry = 3600
+enable_signup = false          # 社内ツールなので招待制。管理画面からユーザーを追加する
+
+[auth.email]
+enable_signup = false
+enable_confirmations = true
+
+# --- Edge Functions -----------------------------------------------------------
+# Slack / フォームは外部から署名付き・公開で叩かれるため JWT 検証を切る。
+# 署名検証（Slack）とレートリミット（フォーム）が代わりの防御線。
+
+[functions.slack-events]
+verify_jwt = false
+
+[functions.submit-feedback]
+verify_jwt = false
+
+[functions.process-feedback]
+verify_jwt = true
