@@ -1,0 +1,29 @@
+{
+  "display_information": {
+    "name": "フィードバックデバッガー",
+    "description": "Slackの投稿からフィードバックを集約します",
+    "background_color": "#0f172a"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "feedback-debugger",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "users:read",
+        "reactions:read"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
