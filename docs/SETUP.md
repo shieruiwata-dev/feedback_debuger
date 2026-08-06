@@ -58,10 +58,13 @@ from apps a left join feedback_sources s on s.app_id = a.id;
    |---|---|
    | `channels:history` | パブリックチャンネルのメッセージ受信 |
    | `channels:read` | チャンネル情報の取得 |
-   | `chat:write` | （パーマリンク取得の前提となる基本権限） |
    | `users:read` | 投稿者の表示名取得 |
    | `reactions:read` | 📮 リアクションでフィードバックを拾う経路に必要 |
    | `groups:history` | プライベートチャンネルも対象にする場合のみ |
+   > 付与するのは**読み取り権限だけ**。`chat:write` は入れない。
+   > コードは投稿系 API を一切呼ばないので、権限側で書き込みを不可能にしておく。
+   > 会社のワークスペースに入れる際の説明もこの方が通しやすい。
+
 3. **Install to Workspace** し、`Bot User OAuth Token`（`xoxb-...`）を控える
 4. **Basic Information** → App Credentials から `Signing Secret` を控える
 5. 対象チャンネル `#（フィードバック投稿チャンネル）` に Bot を招待する
