@@ -60,6 +60,7 @@ from apps a left join feedback_sources s on s.app_id = a.id;
    | `channels:read` | チャンネル情報の取得 |
    | `chat:write` | （パーマリンク取得の前提となる基本権限） |
    | `users:read` | 投稿者の表示名取得 |
+   | `reactions:read` | 📮 リアクションでフィードバックを拾う経路に必要 |
    | `groups:history` | プライベートチャンネルも対象にする場合のみ |
 3. **Install to Workspace** し、`Bot User OAuth Token`（`xoxb-...`）を控える
 4. **Basic Information** → App Credentials から `Signing Secret` を控える
@@ -84,8 +85,10 @@ supabase functions deploy slack-events --no-verify-jwt
 7. Request URL に `https://<project-ref>.supabase.co/functions/v1/slack-events` を入力
    - 入力した瞬間に Slack が `url_verification` を投げるので、**Verified ✓** になることを確認
    - ここで失敗する場合は `--no-verify-jwt` を付け忘れていないか確認する
-8. **Subscribe to bot events** に `message.channels` を追加
-   （プライベートチャンネルも対象にするなら `message.groups` も）
+8. **Subscribe to bot events** に以下を追加
+   - `message.channels` … チャンネルの投稿を受信する
+     （プライベートチャンネルも対象にするなら `message.groups` も）
+   - `reaction_added` … 📮 リアクションで過去の投稿を拾い上げる経路に使う
 9. **Save Changes** → 変更を反映するため **Reinstall your app**
 
 ### 確認
@@ -98,6 +101,34 @@ from feedback_items order by created_at desc limit 5;
 ```
 
 この時点では `summary` / `priority` / `category` / `embedding` はすべて NULL で正しい。
+
+### フィードバック以外の投稿の扱い
+
+チャンネルには雑談・連絡・自動通知も流れてくるので、3 層で選別している。
+
+| 層 | いつ | 何をするか | 変更方法 |
+|---|---|---|---|
+| 0 | insert 前 | 相槌・URL だけ・絵文字だけ・設定した定型文を**破棄** | `NOISE_PATTERNS` / `NOISE_MIN_LENGTH` / `ENABLE_PREINSERT_NOISE_FILTER` |
+| 1 | Dify 分類時 | AI が「フィードバックでない」と判定したものを `status='ignored'` に落とす | `app_settings` の `triage.min_confidence` |
+| 2 | 人 | 📮 リアクション、`#fb` マーク、ダッシュボードの「フィードバックに戻す」 | `SLACK_FEEDBACK_MARKERS` / `SLACK_FEEDBACK_REACTIONS` |
+
+層 1 のノイズは**削除せず DB に残る**ので、ダッシュボードの「ノイズ判定」欄から
+判定理由と確信度を確認し、誤判定はワンクリックで戻せる。
+
+チームには「フィードバックとして確実に拾ってほしいものは `#fb` を付けるか 📮 を押す」
+とだけ伝えれば足りる（付けなくても AI が拾う）。
+
+> **絵文字を変えたい場合**: `SLACK_FEEDBACK_REACTIONS` にコロン無しの emoji name を
+> カンマ区切りで指定する（既定は `inbox_tray,memo,mega`）。
+> カスタム絵文字も名前を書けば使える。
+
+### 確認（選別）
+
+```
+チャンネルに「了解です」と投稿   → feedback_items に入らない（層 0 で破棄）
+チャンネルに「#fb 了解です」    → 入る（明示マークが層 0 を上書き）
+過去の投稿に 📮 を付ける        → その投稿が取り込まれる
+```
 
 > **チャンネル ID の調べ方**: Slack でチャンネルを開き、チャンネル名 → 一番下の「チャンネル ID」。
 > 別のチャンネルを追加する場合は `feedback_sources` に行を足す。
@@ -198,14 +229,27 @@ done
 
    ```
    あなたは社内プロダクトのフィードバック分類器です。
-   与えられたユーザーの意見を読み、次の JSON だけを出力してください。
+   与えられたテキストを読み、次の JSON だけを出力してください。
    前後の説明文やコードフェンスは書かないでください。
 
    {
+     "is_feedback": true | false,
+     "confidence": 0.0〜1.0,
+     "noise_reason": "is_feedback が false のときだけ、その理由を日本語で 30 字以内",
      "priority": "urgent" | "high" | "medium" | "low",
      "category": "bug" | "feature_request" | "ux" | "other",
      "summary": "日本語で 60 字以内の要約"
    }
+
+   is_feedback の基準:
+   このテキストは Slack チャンネルから拾ったもので、
+   プロダクトへの意見以外（雑談・業務連絡・自動通知）も混ざっています。
+   - true:  プロダクトの不具合報告、要望、使いにくさの指摘、
+            ユーザーからの声の共有（伝聞でも可）
+   - false: 日程調整・雑談・挨拶、デプロイやCIの自動通知、
+            プロダクトと無関係な相談、社内の事務連絡
+   判断に迷う場合は true にし、confidence を 0.5 以下にしてください。
+   （確信度が低いものは取りこぼしを避けるため残す設計になっています）
 
    priority の基準:
    - urgent: 業務が停止する / データが失われる / 全ユーザーに影響
@@ -221,9 +265,12 @@ done
 
    対象アプリ: {{app_name}}
 
-   ユーザーの意見:
+   テキスト:
    {{feedback_text}}
    ```
+
+   > `is_feedback` を返さない旧いワークフローでもコード側は動く（その場合は常に
+   > フィードバック扱いになり、選別は層 0 と層 2 だけになる）。
 
 5. **終了ノード**の出力変数名を `result` にし、LLM ノードの出力を割り当てる
    （`priority` / `category` / `summary` の 3 変数に分けても動く。コード側が両方に対応している）
@@ -254,6 +301,19 @@ curl -X POST https://api.dify.ai/v1/workflows/run \
 ```
 
 `data.outputs.result` に JSON が入っていれば OK。
+ノイズ側も確認しておく:
+
+```bash
+curl -X POST https://api.dify.ai/v1/workflows/run \
+  -H "Authorization: Bearer app-xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": {"feedback_text":"明日の定例、15時からに変更でお願いします","app_name":"マイサポ"},
+    "response_mode": "blocking",
+    "user": "setup-check"
+  }'
+# → is_feedback: false, confidence: 0.9 前後が返ればよい
+```
 
 ---
 
@@ -441,6 +501,15 @@ Lovable を外して Vercel / Netlify / Cloudflare Pages に載せ替えるこ�
 | `OPENAI_API_KEY` | AI 有効時 | – | 埋め込み生成用 |
 | `EMBEDDING_MODEL` | – | `text-embedding-3-small` | – |
 | `EMBEDDING_DIMENSIONS` | – | `1536` | DB の `vector(N)` と一致させる |
+| `ENABLE_PREINSERT_NOISE_FILTER` | – | `true` | 層 0（insert 前の破棄）の有効/無効 |
+| `NOISE_MIN_LENGTH` | – | `6` | 装飾を除いた本文がこの文字数未満ならノイズ |
+| `NOISE_PATTERNS` | – | – | 自動通知等を落とす正規表現をカンマ区切りで |
+| `SLACK_FEEDBACK_MARKERS` | – | `#fb,#feedback,#フィードバック,#要望,#不具合` | 明示マーク |
+| `SLACK_FEEDBACK_REACTIONS` | – | `inbox_tray,memo,mega` | 拾い上げに使う emoji name |
+| `ENABLE_AI_TRIAGE` | – | `true` | 層 1（AI によるノイズ判定）の有効/無効 |
+| `AI_TRIAGE_SOURCE_TYPES` | – | `slack` | AI トリアージを掛けるソース種別 |
+| `AI_TRIAGE_MIN_CONFIDENCE` | – | `0.7` | app_settings 未設定時のフォールバック |
+| `SLACK_API_BASE_URL` | – | `https://slack.com/api` | 社内プロキシ経由にする場合のみ |
 | `FORM_ALLOWED_ORIGINS` | 本番必須 | `*` | フォームを設置するオリジンをカンマ区切りで |
 | `FORM_RATE_LIMIT_SHORT_MAX` | – | `5` | 短期ウィンドウの上限件数 |
 | `FORM_RATE_LIMIT_SHORT_WINDOW_SEC` | – | `60` | 短期ウィンドウの秒数 |
@@ -467,7 +536,9 @@ Lovable を外して Vercel / Netlify / Cloudflare Pages に載せ替えるこ�
 - [ ] Slack App 作成、Bot Token Scopes 設定、ワークスペースにインストール
 - [ ] Slack Bot を対象チャンネルに招待（`/invite`）
 - [ ] Slack Event Subscriptions の Request URL 設定と Verified 確認
-- [ ] `message.channels` イベントの購読設定 + Reinstall
+- [ ] `message.channels` / `reaction_added` イベントの購読設定 + Reinstall
+- [ ] フィードバック拾い上げ用の絵文字を決めてチームに周知（既定は 📮 = `inbox_tray`）
+- [ ] 自動通知が多いチャンネルなら `NOISE_PATTERNS` に定型文を登録
 - [ ] 自社サイトへのフィードバックウィジェット設置
 - [ ] `FORM_ALLOWED_ORIGINS` に設置先オリジンを登録
 - [ ] Dify アカウント作成、分類ワークフロー作成・公開、API キー発行

@@ -112,7 +112,7 @@ export async function fetchPermalink(
   if (!token) return null;
 
   try {
-    const url = new URL("https://slack.com/api/chat.getPermalink");
+    const url = new URL(`${slackApiBase()}/chat.getPermalink`);
     url.searchParams.set("channel", channel);
     url.searchParams.set("message_ts", messageTs);
 
@@ -128,13 +128,72 @@ export async function fetchPermalink(
   }
 }
 
+/**
+ * Slack Web API のベース URL。
+ * 既定は本番。SLACK_API_BASE_URL で差し替えられるようにしてあるのは、
+ * 社内プロキシ経由にする場合と、テストでスタブに向ける場合のため。
+ */
+function slackApiBase(): string {
+  return env("SLACK_API_BASE_URL") ?? "https://slack.com/api";
+}
+
+export interface SlackReactionEvent {
+  type: string;
+  reaction?: string;
+  user?: string;
+  item?: { type?: string; channel?: string; ts?: string };
+}
+
+/**
+ * リアクションが付いた元メッセージを取り出す。
+ * 「あとから拾う」経路（📮 を付けてフィードバック扱いにする）で使う。
+ * conversations.history に latest=ts, inclusive=true, limit=1 を渡すとその 1 件が返る。
+ */
+export async function fetchMessage(
+  channel: string,
+  ts: string,
+): Promise<SlackMessageEvent | null> {
+  const token = env("SLACK_BOT_TOKEN");
+  if (!token) {
+    console.warn("SLACK_BOT_TOKEN not set; cannot fetch reacted message");
+    return null;
+  }
+
+  try {
+    const url = new URL(`${slackApiBase()}/conversations.history`);
+    url.searchParams.set("channel", channel);
+    url.searchParams.set("latest", ts);
+    url.searchParams.set("oldest", ts);
+    url.searchParams.set("inclusive", "true");
+    url.searchParams.set("limit", "1");
+
+    const res = await fetchWithTimeout(url.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
+    }, 8_000);
+
+    const body = await res.json();
+    if (!body?.ok) {
+      console.warn("conversations.history failed:", body?.error);
+      return null;
+    }
+
+    const message = body.messages?.[0];
+    if (!message || message.ts !== ts) return null;
+
+    return { ...message, type: "message", channel } as SlackMessageEvent;
+  } catch (err) {
+    console.warn("conversations.history error:", err);
+    return null;
+  }
+}
+
 /** 投稿者の表示名を取得する（取れなければ user id のまま） */
 export async function fetchUserName(userId: string): Promise<string | null> {
   const token = env("SLACK_BOT_TOKEN");
   if (!token) return null;
 
   try {
-    const url = new URL("https://slack.com/api/users.info");
+    const url = new URL(`${slackApiBase()}/users.info`);
     url.searchParams.set("user", userId);
 
     const res = await fetchWithTimeout(url.toString(), {

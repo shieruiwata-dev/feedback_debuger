@@ -62,8 +62,9 @@ export async function fetchDashboardData(appId: string): Promise<DashboardData> 
       .limit(CLUSTER_LIMIT),
     db
       .from("feedback_items")
+      // supabase-js は select 文字列を型レベルで解析するため、連結せず 1 つのリテラルで書く
       .select(
-        "id, app_id, source_type, raw_text, summary, priority, category, cluster_id, source_meta, status, created_at",
+        "id, app_id, source_type, raw_text, summary, priority, category, cluster_id, source_meta, status, created_at, is_feedback, triage_reason, triage_confidence",
       )
       .eq("app_id", appId)
       .order("created_at", { ascending: false })
@@ -96,6 +97,29 @@ export async function updateClusterStatus(
   const { error } = await requireSupabase().rpc("set_cluster_status", {
     p_cluster_id: clusterId,
     p_status: status,
+  });
+
+  if (error) throw error;
+}
+
+/**
+ * ノイズ判定を人手で取り消す（誤判定の救済）。
+ * status を new に戻し、再エンリッチメントの対象にするので、
+ * 次の再処理でクラスタリングまで進む。
+ */
+export async function restoreItemAsFeedback(itemId: string): Promise<void> {
+  if (isMockMode) {
+    const item = mockState.items.find((i) => i.id === itemId);
+    if (item) {
+      item.status = "new";
+      item.is_feedback = true;
+      item.triage_reason = "manual_restore";
+    }
+    return;
+  }
+
+  const { error } = await requireSupabase().rpc("restore_feedback_item", {
+    p_item_id: itemId,
   });
 
   if (error) throw error;

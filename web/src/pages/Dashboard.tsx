@@ -4,10 +4,12 @@ import { FilterBar } from "../components/FilterBar";
 import { ClusterCard } from "../components/ClusterCard";
 import { ItemRow } from "../components/ItemRow";
 import { StatusSelect } from "../components/StatusSelect";
+import { NoiseList } from "../components/NoiseList";
 import {
   fetchApps,
   fetchDashboardData,
   isMockMode,
+  restoreItemAsFeedback,
   updateClusterStatus,
   updateItemStatus,
 } from "../lib/api";
@@ -122,16 +124,27 @@ export function Dashboard({ onSignOut }: { onSignOut?: () => void }) {
       .sort((a, b) => b.score - a.score);
   }, [clusters, filters, itemsByCluster, itemMatchesFilters]);
 
-  /** まだクラスタに入っていない item（AI 処理前 / 埋め込み失敗分） */
+  /**
+   * まだクラスタに入っていない item（AI 処理前 / 埋め込み失敗分）。
+   * ノイズ判定されたものは本編に混ぜず、専用の欄に分ける。
+   */
   const unclusteredItems = useMemo(() => {
     return items.filter((item) => {
       if (item.cluster_id) return false;
+      if (item.status === "ignored") return false;
       if (filters.category !== "all" && item.category !== filters.category) return false;
       if (filters.priority !== "all" && item.priority !== filters.priority) return false;
       if (filters.status !== "all" && item.status !== filters.status) return false;
       return itemMatchesFilters(item);
     });
   }, [items, filters, itemMatchesFilters]);
+
+  /** ノイズ判定された item（誤判定を戻せるように別枠で出す） */
+  const ignoredItems = useMemo(() => {
+    // ステータスフィルタで別の状態を指定しているときはノイズ欄を出さない
+    if (filters.status !== "all" && filters.status !== "ignored") return [];
+    return items.filter((item) => item.status === "ignored" && itemMatchesFilters(item));
+  }, [items, filters.status, itemMatchesFilters]);
 
   const maxScore = useMemo(
     () => visibleClusters.reduce((max, c) => Math.max(max, c.score), 0),
@@ -149,6 +162,17 @@ export function Dashboard({ onSignOut }: { onSignOut?: () => void }) {
   const handleItemStatus = async (itemId: string, status: Status) => {
     await updateItemStatus(itemId, status);
     setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, status } : i)));
+  };
+
+  const handleRestore = async (itemId: string) => {
+    await restoreItemAsFeedback(itemId);
+    setItems((prev) =>
+      prev.map((i) =>
+        i.id === itemId
+          ? { ...i, status: "new" as Status, is_feedback: true, triage_reason: "manual_restore" }
+          : i
+      )
+    );
   };
 
   return (
@@ -244,6 +268,8 @@ export function Dashboard({ onSignOut }: { onSignOut?: () => void }) {
                   </ul>
                 </section>
               )}
+
+              <NoiseList items={ignoredItems} onRestore={handleRestore} />
             </>
           )}
       </main>

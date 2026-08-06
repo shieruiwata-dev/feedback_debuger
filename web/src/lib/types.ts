@@ -1,7 +1,7 @@
 export type SourceType = "slack" | "form" | "email";
 export type Priority = "urgent" | "high" | "medium" | "low";
 export type Category = "bug" | "feature_request" | "ux" | "other";
-export type Status = "new" | "reviewing" | "adopted" | "done" | "rejected";
+export type Status = "new" | "reviewing" | "adopted" | "done" | "rejected" | "ignored";
 
 export interface App {
   id: string;
@@ -33,6 +33,11 @@ export interface FeedbackItem {
   source_meta: Record<string, unknown>;
   status: Status;
   created_at: string;
+  /** null = 未判定 / false = ノイズ判定 */
+  is_feedback: boolean | null;
+  /** 判定理由（ai:雑談のため / heuristic:too_short / marker:#fb など） */
+  triage_reason: string | null;
+  triage_confidence: number | null;
 }
 
 export interface Filters {
@@ -53,7 +58,10 @@ export const EMPTY_FILTERS: Filters = {
 
 export const PRIORITIES: Priority[] = ["urgent", "high", "medium", "low"];
 export const CATEGORIES: Category[] = ["bug", "feature_request", "ux", "other"];
-export const STATUSES: Status[] = ["new", "reviewing", "adopted", "done", "rejected"];
+/** クラスタのステータス変更で選べる値。ignored はクラスタには使わない */
+export const CLUSTER_STATUSES: Status[] = ["new", "reviewing", "adopted", "done", "rejected"];
+/** フィルタで選べる値（ノイズ欄を見るために ignored も含む） */
+export const STATUSES: Status[] = [...CLUSTER_STATUSES, "ignored"];
 export const SOURCE_TYPES: SourceType[] = ["slack", "form", "email"];
 
 export const PRIORITY_LABEL: Record<Priority, string> = {
@@ -76,6 +84,7 @@ export const STATUS_LABEL: Record<Status, string> = {
   adopted: "採用",
   done: "完了",
   rejected: "見送り",
+  ignored: "ノイズ",
 };
 
 export const SOURCE_LABEL: Record<SourceType, string> = {

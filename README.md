@@ -15,6 +15,7 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
 - [アーキテクチャ](#アーキテクチャ)
 - [ディレクトリ構成](#ディレクトリ構成)
 - [セットアップ](#セットアップ)
+- [フィードバック選別（ノイズ除去）](#フィードバック選別ノイズ除去)
 - [採用スコアの算出方法](#採用スコアの算出方法)
 - [クラスタリングの挙動](#クラスタリングの挙動)
 - [チューニング](#チューニング)
@@ -35,6 +36,9 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
 埋め込みベクトルで類似する意見どうしがクラスタにまとめられ、
 「件数 × 優先度」の採用スコア順にダッシュボードへ並ぶ。
 
+Slack チャンネルにはフィードバック以外の投稿も流れてくるため、
+[フィードバック選別](#フィードバック選別ノイズ除去)で雑談・連絡・自動通知を落としている。
+
 ---
 
 ## アーキテクチャ
@@ -45,13 +49,20 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
  FeedbackWidget ────┘        │
                              │ 共通フォーマットに正規化
                              │ { app_id, source_type, raw_text, source_meta, external_id }
+                             │
+                             │ 層 0: 定型ノイズを破棄（#fb / 📮 が付いていれば素通り）
                              ↓
                       feedback_items に INSERT
                              │
                              │ バックグラウンド（Slack の 3 秒制限を守るため同期処理しない）
                              ↓
-                   ┌─── Dify workflow ────→ priority / category / summary
-                   └─── Embeddings API ───→ vector(1536)
+                        Dify workflow
+                             │ priority / category / summary / is_feedback
+                             │
+                             ├─ 層 1: ノイズ判定 → status='ignored' でここで打ち切り
+                             │        （埋め込み API を呼ばずに済ませる）
+                             ↓
+                        Embeddings API ───→ vector(1536)
                              ↓
               pgvector で同一 app_id 内の既存クラスタと類似度比較
                  類似度 ≥ 0.85 → 既存クラスタに紐付け（item_count +1）
@@ -71,7 +82,7 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
 |---|---|---|
 | `slack-events` | 無効 | Slack Events API の受信口（署名検証で保護） |
 | `submit-feedback` | 無効 | フォームの受信口（レートリミット + ハニーポットで保護） |
-| `process-feedback` | 有効 | 分類・埋め込み・クラスタリングの実行 / 再実行 / 再スコアリング |
+| `process-feedback` | 有効 | 分類・トリアージ・埋め込み・クラスタリングの実行 / 再実行 / 再スコアリング |
 
 ---
 
@@ -85,8 +96,9 @@ supabase/
     20260805000200_clustering.sql # クラスタリング / スコアリング関数
     20260805000300_rls.sql        # RLS ポリシーと GRANT
     20260805000400_seed.sql       # マイサポ + Slack チャンネル登録
+    20260805000500_triage.sql     # ノイズ選別（ignored ステータス・復帰 RPC）
   functions/
-    _shared/                      # 全アダプタ共通の処理
+    _shared/                      # 全アダプタ共通の処理（triage.ts に選別ロジック）
     slack-events/                 # Slack 取り込みアダプタ
     submit-feedback/              # フォーム取り込みアダプタ
     process-feedback/             # エンリッチメント実行 / 再実行
@@ -96,6 +108,7 @@ web/
   src/components/FeedbackWidget.tsx  # 各アプリに埋め込むフォーム（React 版）
   public/feedback-widget.js          # 同上（素の JS 版・Shadow DOM）
   src/pages/Dashboard.tsx            # ダッシュボード本体
+  src/components/NoiseList.tsx       # ノイズ判定欄（誤判定の復帰）
 docs/
   SETUP.md                        # 手動設定チェックリスト（実装順序に対応）
   DECISIONS.md                    # 実装時の判断と、そう決めた理由
@@ -126,6 +139,84 @@ cd web && cp .env.example .env && npm install && npm run dev
 ```
 
 `web/.env` を設定しなければ、フロントはモックデータで起動する（UI を先に固めたいとき用）。
+
+---
+
+## フィードバック選別（ノイズ除去）
+
+Slack チャンネルには「今日休みます」「デプロイしました」「👍」なども流れてくる。
+これらをそのままクラスタリングすると、スコア上位が業務連絡で埋まって使い物にならない。
+
+選別は 3 層。**不可逆な破棄は層 0 だけ**にして、迷うものは必ず DB に残す設計にしている。
+
+| 層 | タイミング | 対象 | 結果 |
+|---|---|---|---|
+| 0 | insert 前 | 相槌 / URL だけ / 絵文字だけ / `NOISE_PATTERNS` に一致 | **破棄**（DB に残らない） |
+| 1 | Dify 分類時 | AI が `is_feedback: false` かつ確信度が閾値以上 | `status='ignored'`（DB に残る） |
+| 2 | 人 | 📮 リアクション / `#fb` マーク / ダッシュボードの復帰ボタン | 層 0・層 1 を上書きして取り込む |
+
+### 層 0: 定型ノイズの破棄（AI コストゼロ）
+
+`「了解です」「ありがとうございます」「👍」「https://ci.example.com/builds/482」` のような、
+判断の余地がない投稿を insert 前に落とす。
+
+```bash
+# 自動通知の定型文を追加で落とす
+supabase secrets set NOISE_PATTERNS='^\[Deploy\],^Build #\d+,^\[ALERT\]'
+
+# 層 0 自体を止める（すべて DB に入れて層 1 に任せる）
+supabase secrets set ENABLE_PREINSERT_NOISE_FILTER=false
+```
+
+### 層 1: AI による判定
+
+Dify の分類ワークフローが `is_feedback` / `confidence` / `noise_reason` も返す。
+**確信度が閾値以上のときだけ**ノイズ扱いにするので、AI が迷ったものは一覧に残る。
+
+```sql
+-- ノイズ判定を採用する確信度の下限（既定 0.7）
+-- 下げるとノイズがよく落ちるが誤判定も増える。上げると逆
+update app_settings set value = '0.85'::jsonb where key = 'triage.min_confidence';
+```
+
+判定されたものは削除されず `status='ignored'` になり、
+ダッシュボードの「ノイズ判定」欄に**判定理由と確信度つき**で並ぶ。
+誤判定を見つけたら「フィードバックに戻す」で復帰でき、再処理でクラスタリングまで進む。
+
+### 層 2: 人が明示する
+
+- **`#fb` を本文に含める** … 層 0・層 1 を両方素通りして必ず取り込む。マーク自体は本文から除去される
+- **📮 リアクションを付ける** … 過去の投稿でも拾える。既にノイズ判定されていれば復帰する
+- **ダッシュボードの「フィードバックに戻す」** … 誤判定の救済
+
+```bash
+# マークと絵文字は変更できる（絵文字はコロン無しの emoji name）
+supabase secrets set \
+  SLACK_FEEDBACK_MARKERS='#fb,#voc,#要望' \
+  SLACK_FEEDBACK_REACTIONS='inbox_tray,mega,voc'
+```
+
+### 効き具合の確認
+
+```sql
+-- 直近 1 週間の選別結果
+select
+  count(*) filter (where status = 'ignored')                as ノイズ,
+  count(*) filter (where status <> 'ignored')               as フィードバック,
+  count(*) filter (where triage_reason like 'marker:%'
+                      or triage_reason like 'reaction:%')   as 明示マーク,
+  count(*) filter (where triage_reason like 'ai_low_confidence:%') as 判定保留
+from feedback_items
+where created_at > now() - interval '7 days';
+
+-- ノイズ判定の理由を確信度順に見る（閾値を動かす材料）
+select triage_confidence, triage_reason, left(raw_text, 40)
+from feedback_items where status = 'ignored'
+order by triage_confidence asc limit 20;
+```
+
+層 0 で捨てた分は DB に残らないので、件数は Edge Function のログ
+（`dropped before insert (...)`）で確認する。
 
 ---
 
@@ -191,7 +282,7 @@ where key = 'scoring.priority_weights';
 ## テスト
 
 ```bash
-# Edge Function（署名検証・Dify 出力の正規化・アダプタの結合テスト）
+# Edge Function（署名検証・Dify 出力の正規化・ノイズ選別・アダプタの結合テスト）
 deno test --allow-all supabase/functions/tests/
 
 # DB（クラスタリング・スコアリング・RLS）
@@ -200,6 +291,8 @@ psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/clustering_test.sql
 psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/rls_test.sql
+psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
+  -v ON_ERROR_STOP=1 -f supabase/tests/triage_test.sql
 
 # フロント
 cd web && npm run build
@@ -240,5 +333,13 @@ SQL テストは末尾で `rollback` するのでデータは残らない。
 - **`priority` はクラスタ内の最高値を採用している。** 1 件でも urgent が混ざるとクラスタ全体が urgent になる。
   誤分類が 1 件あるだけで順位が動くため、運用しながら「最頻値」への変更も検討する。
 - **Dify の分類結果を人手で修正する UI が無い。** 現状 status しか変更できない。
+- **層 0 で捨てた投稿は復元できない。** DB に残らないので、
+  `#fb` を付け直すか 📮 を押して再送してもらう以外に手段がない。
+  取りこぼしが心配なら `ENABLE_PREINSERT_NOISE_FILTER=false` にして
+  すべて層 1（DB に残る側）に回す運用もできる。
+- **ノイズ判定の精度を測る仕組みが無い。** 「戻す」操作の回数は記録されるが
+  （`triage_reason = 'manual_restore'`）、
+  逆に「ノイズを見逃した」件数は分からない。閾値調整は目視に頼ることになる。
+- **📮 リアクションは `reaction_added` のみ扱う。** 付け間違えて外しても取り込みは取り消されない。
 - **埋め込みは OpenAI に直接投げている。** Dify に汎用の embeddings API が無いため
   （詳細は [docs/DECISIONS.md](docs/DECISIONS.md)）。AI 関連の課金経路が Dify と OpenAI の 2 つになる。

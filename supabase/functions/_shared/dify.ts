@@ -63,7 +63,43 @@ function normalizeClassification(
     priority: coerce(obj["priority"], PRIORITIES, "medium") as Priority,
     category: coerce(obj["category"], CATEGORIES, "other") as Category,
     summary: coerceSummary(obj["summary"], rawText),
+    // is_feedback を返さない旧ワークフローとの互換のため、既定は true（取りこぼさない側に倒す）
+    is_feedback: coerceBool(obj["is_feedback"] ?? obj["isFeedback"], true),
+    confidence: coerceConfidence(obj["confidence"] ?? obj["is_feedback_confidence"]),
+    noise_reason: coerceReason(obj["noise_reason"] ?? obj["reason"]),
   };
+}
+
+/** LLM は true / "true" / "yes" / 1 などを混ぜて返してくる */
+function coerceBool(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const norm = value.trim().toLowerCase();
+    if (["true", "yes", "y", "1", "はい"].includes(norm)) return true;
+    if (["false", "no", "n", "0", "いいえ"].includes(norm)) return false;
+  }
+  return fallback;
+}
+
+/** 確信度。取れなければ 1.0 とみなす（閾値判定で落とされないように） */
+function coerceConfidence(value: unknown): number {
+  const n = typeof value === "number"
+    ? value
+    : typeof value === "string"
+    ? Number.parseFloat(value)
+    : NaN;
+
+  if (!Number.isFinite(n)) return 1;
+  // 0〜100 で返してくるモデルもあるので正規化する
+  const scaled = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, scaled));
+}
+
+function coerceReason(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.slice(0, 300) : null;
 }
 
 /** LLM の出力ゆらぎ（大文字・前後空白・"feature request" 等）を吸収する */

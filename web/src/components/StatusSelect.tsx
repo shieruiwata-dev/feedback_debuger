@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { STATUSES, STATUS_LABEL, type Status } from "../lib/types";
+import { CLUSTER_STATUSES, STATUS_LABEL, type Status } from "../lib/types";
 
 interface Props {
   value: Status;
@@ -38,7 +38,7 @@ export function StatusSelect({ value, onChange, disabled }: Props) {
         className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 disabled:opacity-50 focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500"
         aria-label="ステータス"
       >
-        {STATUSES.map((s) => (
+        {CLUSTER_STATUSES.map((s) => (
           <option key={s} value={s}>
             {STATUS_LABEL[s]}
           </option>
