@@ -64,7 +64,7 @@ export async function fetchDashboardData(appId: string): Promise<DashboardData> 
       .from("feedback_items")
       // supabase-js は select 文字列を型レベルで解析するため、連結せず 1 つのリテラルで書く
       .select(
-        "id, app_id, source_type, raw_text, summary, priority, category, cluster_id, source_meta, status, created_at, is_feedback, triage_reason, triage_confidence",
+        "id, app_id, source_type, raw_text, summary, priority, category, cluster_id, source_meta, status, created_at, is_feedback, triage_reason, triage_confidence, parent_item_id, segment_index",
       )
       .eq("app_id", appId)
       .order("created_at", { ascending: false })

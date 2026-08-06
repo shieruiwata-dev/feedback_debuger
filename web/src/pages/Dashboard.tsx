@@ -131,7 +131,8 @@ export function Dashboard({ onSignOut }: { onSignOut?: () => void }) {
   const unclusteredItems = useMemo(() => {
     return items.filter((item) => {
       if (item.cluster_id) return false;
-      if (item.status === "ignored") return false;
+      // ノイズと、分割された原文（実体は子）は本編に出さない
+      if (item.status === "ignored" || item.status === "split") return false;
       if (filters.category !== "all" && item.category !== filters.category) return false;
       if (filters.priority !== "all" && item.priority !== filters.priority) return false;
       if (filters.status !== "all" && item.status !== filters.status) return false;

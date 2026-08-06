@@ -32,6 +32,7 @@ const STATUS_STYLE: Record<Status, string> = {
   done: "bg-slate-100 text-slate-600 ring-1 ring-slate-200",
   rejected: "bg-slate-50 text-slate-400 ring-1 ring-slate-200",
   ignored: "bg-slate-100 text-slate-500 ring-1 ring-slate-300",
+  split: "bg-slate-100 text-slate-500 ring-1 ring-slate-300",
 };
 
 export function PriorityBadge({ value }: { value: Priority | null }) {

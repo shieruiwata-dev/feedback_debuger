@@ -16,6 +16,7 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
 - [ディレクトリ構成](#ディレクトリ構成)
 - [セットアップ](#セットアップ)
 - [フィードバック選別（ノイズ除去）](#フィードバック選別ノイズ除去)
+- [長文の分割（1 論点 = 1 件）](#長文の分割1-論点--1-件)
 - [採用スコアの算出方法](#採用スコアの算出方法)
 - [クラスタリングの挙動](#クラスタリングの挙動)
 - [チューニング](#チューニング)
@@ -97,6 +98,8 @@ supabase/
     20260805000300_rls.sql        # RLS ポリシーと GRANT
     20260805000400_seed.sql       # マイサポ + Slack チャンネル登録
     20260805000500_triage.sql     # ノイズ選別（ignored ステータス・復帰 RPC）
+    20260805000600_update_slack_channel.sql
+    20260805000700_split_items.sql # 長文の分割（親子関係・split/unsplit RPC）
   functions/
     _shared/                      # 全アダプタ共通の処理（triage.ts に選別ロジック）
     slack-events/                 # Slack 取り込みアダプタ
@@ -220,6 +223,68 @@ order by triage_confidence asc limit 20;
 
 ---
 
+## 長文の分割（1 論点 = 1 件）
+
+1 つの投稿に複数の指摘が混ざっていることがある。
+
+> 検索が遅くて5秒くらい待たされます。あと申請履歴をCSVで出せると助かります。通知メールの文面も少し事務的すぎる気がします。
+
+これを 1 件として扱うと、件数もスコアも実態からズレる:
+
+- 3 つの論点が 1 つのクラスタに入り、それぞれの支持数が見えない
+- 他に「検索が遅い」と言っている人が 5 人いても合流できない
+- priority / category を 1 つしか付けられない（バグと要望と UX が同居する）
+
+そこで **Dify の分類時に論点ごとへ分割し、それぞれを独立した `feedback_items` として持つ**。
+
+```
+元の投稿（status='split' で保存。一覧には出さない）
+  ├─ 検索の応答が遅い          … bug  / high   → 「検索が遅い」クラスタへ
+  ├─ 申請履歴のCSVエクスポート  … feature_request / medium → 別クラスタへ
+  └─ 通知メールの文面が事務的    … ux   / low    → 別クラスタへ
+```
+
+- 分割は **Dify の 1 回の呼び出しの中**で行う（API 呼び出し回数は増えない）
+- 子は `parent_item_id` で原文にたどれる。`source_meta.original_text` に原文も持つ
+- Slack の permalink は子に引き継がれるので、どの子からも元発言へ飛べる
+- **原文は削除しない。** 分割が不適切だったときは `unsplit_feedback_item(<親のid>)` で元に戻せる
+
+### 言い回しが違っても同じ内容ならまとまる
+
+分割した論点は**要約をベクトル化**してクラスタリングする（`EMBEDDING_SOURCE=summary`、既定）。
+
+原文をそのまま埋め込むと、敬語・前置き・周辺の文脈が距離に混ざる。
+要約は Dify 側で「事象だけを書く」よう指示してあるため、表現の揺れが落ちて距離が安定する。
+
+```
+「検索が遅くて待たされる」
+「検索結果がなかなか出てこない」   → いずれも要約は「検索の応答が遅い」
+「商品検索が重いです」              → 同じクラスタに合流し、item_count と score が上がる
+```
+
+原文で埋め込む挙動に戻したい場合は `EMBEDDING_SOURCE=raw_text`。
+
+### 分けすぎないための調整
+
+プロンプトで「迷ったら分けない」と指示している（過剰分割は件数を水増しし、優先順位を誤らせるため）。
+それでも分かれすぎる／分かれなさすぎる場合は、`docs/SETUP.md` の Step 5 にある
+`issues の分け方` の例を増減して調整する。
+
+```sql
+-- 分割の効き具合を見る
+select
+  count(*) filter (where status = 'split')          as 分割された投稿,
+  count(*) filter (where parent_item_id is not null) as 分割で生まれた論点,
+  round(avg(cnt), 2)                                 as 平均分割数
+from feedback_items
+left join lateral (
+  select count(*) as cnt from feedback_items c where c.parent_item_id = feedback_items.id
+) x on true
+where status = 'split';
+```
+
+---
+
 ## 採用スコアの算出方法
 
 ```
@@ -293,6 +358,8 @@ psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/rls_test.sql
 psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/triage_test.sql
+psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
+  -v ON_ERROR_STOP=1 -f supabase/tests/split_test.sql
 
 # フロント
 cd web && npm run build
@@ -341,5 +408,12 @@ SQL テストは末尾で `rollback` するのでデータは残らない。
   （`triage_reason = 'manual_restore'`）、
   逆に「ノイズを見逃した」件数は分からない。閾値調整は目視に頼ることになる。
 - **📮 リアクションは `reaction_added` のみ扱う。** 付け間違えて外しても取り込みは取り消されない。
+- **分割の粒度は LLM 任せ。** 「1 論点」の境界に絶対的な正解はなく、
+  同じ投稿でも実行のたびに 2 分割/3 分割が揺れることがある。
+  過剰分割は件数の水増しに直結するので、運用初期は上の SQL で平均分割数を見ておく。
+- **分割の誤りを個別に直す UI が無い。** `unsplit_feedback_item()` を SQL で叩けば戻せるが、
+  ダッシュボードからは操作できない。
+- **要約を埋め込むため、要約が外すとクラスタリングも外す。**
+  Dify が論点を取り違えた場合、原文が似ていても別クラスタに入る。
 - **埋め込みは OpenAI に直接投げている。** Dify に汎用の embeddings API が無いため
   （詳細は [docs/DECISIONS.md](docs/DECISIONS.md)）。AI 関連の課金経路が Dify と OpenAI の 2 つになる。

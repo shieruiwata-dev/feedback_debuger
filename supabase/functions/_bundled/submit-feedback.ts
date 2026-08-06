@@ -64,15 +64,35 @@ export interface NormalizedFeedback {
 export type SourceType = "slack" | "form" | "email";
 export type Priority = "urgent" | "high" | "medium" | "low";
 export type Category = "bug" | "feature_request" | "ux" | "other";
-export type Status = "new" | "reviewing" | "adopted" | "done" | "rejected" | "ignored";
+export type Status =
+  | "new" | "reviewing" | "adopted" | "done" | "rejected"
+  /** フィードバックではないと判定された */
+  | "ignored"
+  /** 論点ごとに分割された原文。一覧には出さず、子が実体になる */
+  | "split";
 
 export const PRIORITIES: Priority[] = ["urgent", "high", "medium", "low"];
 export const CATEGORIES: Category[] = ["bug", "feature_request", "ux", "other"];
+
+/** 分割後の 1 論点 */
+export interface ClassifiedIssue {
+  /** 原文から抜き出した該当箇所。取れなければ要約で代用する */
+  text: string;
+  summary: string;
+  priority: Priority;
+  category: Category;
+}
 
 export interface Classification {
   priority: Priority;
   category: Category;
   summary: string;
+  /**
+   * 論点ごとの分割結果。
+   * 1 件なら分割しない。2 件以上なら feedback_items を分けて作る。
+   * Dify が items を返さない場合は、上の priority/category/summary から 1 件を組み立てる。
+   */
+  issues: ClassifiedIssue[];
   /** フィードバックとして扱うべきか（Slack の雑談・通知を除くための判定） */
   is_feedback: boolean;
   /** is_feedback の確信度 0〜1。低いものはノイズ判定を採用しない */
@@ -217,10 +237,14 @@ function normalizeClassification(
     obj = result as Record<string, unknown>;
   }
 
+  const issues = coerceIssues(obj["issues"] ?? obj["items"], obj, rawText);
+
   return {
-    priority: coerce(obj["priority"], PRIORITIES, "medium") as Priority,
-    category: coerce(obj["category"], CATEGORIES, "other") as Category,
-    summary: coerceSummary(obj["summary"], rawText),
+    // 分割しない場合の代表値。issues の先頭に揃えておく
+    priority: issues[0].priority,
+    category: issues[0].category,
+    summary: issues[0].summary,
+    issues,
     // is_feedback を返さない旧ワークフローとの互換のため、既定は true（取りこぼさない側に倒す）
     is_feedback: coerceBool(obj["is_feedback"] ?? obj["isFeedback"], true),
     confidence: coerceConfidence(obj["confidence"] ?? obj["is_feedback_confidence"]),
@@ -258,6 +282,64 @@ function coerceReason(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed.slice(0, 300) : null;
+}
+
+/**
+ * 論点の配列を組み立てる。
+ *
+ * 1 つの投稿に複数の指摘が混ざっている場合、Dify は issues に複数返してくる。
+ * issues を返さない（旧ワークフロー / 論点が 1 つ）の場合は、
+ * トップレベルの priority/category/summary から 1 件を組み立てて同じ形に揃える。
+ * こうしておくと、呼び出し側は「常に配列」として扱えて分岐が減る。
+ */
+function coerceIssues(
+  raw: unknown,
+  fallback: Record<string, unknown>,
+  rawText: string,
+): ClassifiedIssue[] {
+  const single = (): ClassifiedIssue[] => [{
+    text: rawText.trim(),
+    summary: coerceSummary(fallback["summary"], rawText),
+    priority: coerce(fallback["priority"], PRIORITIES, "medium") as Priority,
+    category: coerce(fallback["category"], CATEGORIES, "other") as Category,
+  }];
+
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+    ? (() => {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    })()
+    : null;
+
+  if (!list || list.length === 0) return single();
+
+  const issues = list
+    .filter((v): v is Record<string, unknown> => typeof v === "object" && v !== null)
+    .map((v) => ({
+      // 原文の該当箇所。取れなければ要約で代用する（本文が空になるのを防ぐ）
+      text: coerceText(v["text"] ?? v["excerpt"] ?? v["quote"], v["summary"], rawText),
+      summary: coerceSummary(v["summary"], rawText),
+      priority: coerce(v["priority"], PRIORITIES, "medium") as Priority,
+      category: coerce(v["category"], CATEGORIES, "other") as Category,
+    }));
+
+  return issues.length > 0 ? issues : single();
+}
+
+function coerceText(value: unknown, summary: unknown, rawText: string): string {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim().slice(0, 5000);
+  }
+  if (typeof summary === "string" && summary.trim().length > 0) {
+    return summary.trim().slice(0, 5000);
+  }
+  return rawText.trim().slice(0, 5000);
 }
 
 /** LLM の出力ゆらぎ（大文字・前後空白・"feature request" 等）を吸収する */
@@ -744,23 +826,25 @@ export async function checkCaptcha(
 // ===========================================================================
 export interface EnrichResult {
   item_id: string;
-  status: "done" | "failed" | "ignored";
+  status: "done" | "failed" | "ignored" | "split";
   cluster_id?: string | null;
+  /** 分割した場合の子の件数 */
+  split_into?: number;
   error?: string;
 }
 
 /**
  * 1 件の feedback_item を仕上げる。
  *
- *   1. Dify で分類（priority / category / summary / is_feedback / confidence）
+ *   1. Dify で分類（priority / category / summary / is_feedback / issues）
  *   2. フィードバックでないと判定されたら status='ignored' にして打ち切る
- *   3. 埋め込みを生成する
- *   4. assign_item_to_cluster() でクラスタ紐付け + スコア再計算
+ *   3. 論点が 2 つ以上なら、論点ごとの子 item に分割して各子を仕上げる
+ *   4. 埋め込みを生成する
+ *   5. assign_item_to_cluster() でクラスタ紐付け + スコア再計算
  *
- * 分類と埋め込みは以前は並列に投げていたが、トリアージを入れたので直列にした。
- * ノイズと分かった時点で打ち切れば、そのぶんの埋め込み API 呼び出しがまるごと不要になる。
- * 雑多なチャンネルではノイズの方が多数になるため、直列化の遅延より節約が効く
- * （どちらもバックグラウンド実行なのでユーザー体験には影響しない）。
+ * 分割で作られた子は分類済み（親の 1 回の Dify 呼び出しの結果を持つ）なので、
+ * 子に対してこの関数を呼んでも分類はやり直さず 4 以降だけを行う。
+ * Dify の呼び出しは投稿 1 件につき 1 回のままに保たれる。
  */
 export async function enrichItem(
   db: SupabaseClient,
@@ -769,7 +853,7 @@ export async function enrichItem(
   const { data: item, error: loadError } = await db
     .from("feedback_items")
     .select(
-      "id, app_id, source_type, raw_text, is_feedback, triage_reason, apps(name)",
+      "id, app_id, source_type, raw_text, summary, priority, category, is_feedback, triage_reason, parent_item_id, apps(name)",
     )
     .eq("id", itemId)
     .single();
@@ -780,8 +864,14 @@ export async function enrichItem(
     .update({ processing_state: "processing", processing_error: null })
     .eq("id", itemId);
 
-  const appName = (item as { apps?: { name?: string } }).apps?.name ?? "";
   const rawText = item.raw_text as string;
+
+  // 分割で生まれた子は分類済み。ここを飛ばして埋め込み → クラスタリングへ直行する
+  if (isPreClassified(item)) {
+    return await embedAndCluster(db, itemId, rawText, item.summary as string | null);
+  }
+
+  const appName = (item as { apps?: { name?: string } }).apps?.name ?? "";
   const sourceType = item.source_type as SourceType;
   // 明示マーク済み（#fb / 📮 リアクション / 人手で復帰）は AI 判定で落とさない
   const forced = item.is_feedback === true;
@@ -794,12 +884,6 @@ export async function enrichItem(
     return await markFailed(db, itemId, `classify: ${errorMessage(err)}`);
   }
 
-  const update: Record<string, unknown> = {
-    summary: classification.summary,
-    priority: classification.priority,
-    category: classification.category,
-  };
-
   // --- 2. トリアージ -------------------------------------------------------
   const triageApplies = !forced && shouldAiTriage(sourceType);
   const threshold = await resolveThreshold(db);
@@ -808,7 +892,11 @@ export async function enrichItem(
 
   if (triageApplies && confidentlyNoise) {
     // 要約と分類は保存しておく（ノイズ欄で内容を確認して復帰判断できるようにする）
-    await db.from("feedback_items").update(update).eq("id", itemId);
+    await db.from("feedback_items").update({
+      summary: classification.summary,
+      priority: classification.priority,
+      category: classification.category,
+    }).eq("id", itemId);
 
     const reason = `ai:${classification.noise_reason ?? "フィードバックではないと判定"}`;
     const { error } = await db.rpc("mark_item_as_noise", {
@@ -823,8 +911,19 @@ export async function enrichItem(
     return { item_id: itemId, status: "ignored" };
   }
 
-  // フィードバックと判定された（または判定を飛ばした）ことを記録する
-  update.is_feedback = true;
+  // --- 3. 論点が複数あれば分割 ---------------------------------------------
+  if (classification.issues.length > 1) {
+    return await splitAndEnrich(db, itemId, classification.issues);
+  }
+
+  // --- 4-5. 単一論点はその場で仕上げる -------------------------------------
+  const update: Record<string, unknown> = {
+    summary: classification.summary,
+    priority: classification.priority,
+    category: classification.category,
+    is_feedback: true,
+  };
+
   if (!forced) {
     update.triage_confidence = classification.confidence;
     update.triage_reason = classification.is_feedback
@@ -833,22 +932,86 @@ export async function enrichItem(
       : `ai_low_confidence:${classification.noise_reason ?? "判定不能"}`;
   }
 
-  // --- 3. 埋め込み ---------------------------------------------------------
-  try {
-    // pgvector は文字列リテラル "[0.1,0.2,...]" 形式を受け付ける
-    update.embedding = JSON.stringify(await embedText(rawText));
-  } catch (err) {
-    await db.from("feedback_items").update(update).eq("id", itemId);
-    return await markFailed(db, itemId, `embedding: ${errorMessage(err)}`);
-  }
-
   const { error: updateError } = await db
     .from("feedback_items").update(update).eq("id", itemId);
   if (updateError) {
     return await markFailed(db, itemId, `update: ${updateError.message}`);
   }
 
-  // --- 4. クラスタリング ---------------------------------------------------
+  return await embedAndCluster(db, itemId, rawText, classification.summary);
+}
+
+/**
+ * 論点ごとに子 item を作り、それぞれを仕上げる。
+ * 親は status='split' になって一覧から外れる（原文は残る）。
+ */
+async function splitAndEnrich(
+  db: SupabaseClient,
+  parentId: string,
+  issues: ClassifiedIssue[],
+): Promise<EnrichResult> {
+  const { data: children, error } = await db.rpc("split_feedback_item", {
+    p_parent_id: parentId,
+    p_segments: issues.map((i) => ({
+      text: i.text,
+      summary: i.summary,
+      priority: i.priority,
+      category: i.category,
+    })),
+  });
+
+  if (error) return await markFailed(db, parentId, `split: ${error.message}`);
+
+  const rows = (children ?? []) as Array<{ id: string }>;
+  console.info(`item ${parentId} split into ${rows.length} issues`);
+
+  // 子はクラスタリングまで進める。1 件失敗しても他は続行する
+  // （失敗した子は processing_state='failed' で残り、再処理バッチが拾う）
+  for (const child of rows) {
+    try {
+      await enrichItem(db, child.id);
+    } catch (err) {
+      console.error(`child ${child.id} enrichment failed:`, err);
+    }
+  }
+
+  return { item_id: parentId, status: "split", split_into: rows.length };
+}
+
+/**
+ * 埋め込みを作ってクラスタに載せる。
+ *
+ * ベクトル化するのは既定で「要約」。
+ * 同じ内容が違う言い回しで届いたときにまとめたいので、
+ * 前置きや敬語や周辺文脈が混ざった原文より、
+ * 論点だけに正規化された要約の方が距離が安定する。
+ * EMBEDDING_SOURCE=raw_text にすれば原文を使う挙動に戻せる。
+ */
+async function embedAndCluster(
+  db: SupabaseClient,
+  itemId: string,
+  rawText: string,
+  summary: string | null,
+): Promise<EnrichResult> {
+  const useSummary = (env("EMBEDDING_SOURCE") ?? "summary") === "summary";
+  const target = useSummary && summary && summary.trim().length > 0 ? summary : rawText;
+
+  let embedding: number[];
+  try {
+    embedding = await embedText(target);
+  } catch (err) {
+    return await markFailed(db, itemId, `embedding: ${errorMessage(err)}`);
+  }
+
+  const { error: updateError } = await db.from("feedback_items")
+    // pgvector は文字列リテラル "[0.1,0.2,...]" 形式を受け付ける
+    .update({ embedding: JSON.stringify(embedding) })
+    .eq("id", itemId);
+
+  if (updateError) {
+    return await markFailed(db, itemId, `update: ${updateError.message}`);
+  }
+
   const { data: clusterId, error: clusterError } = await db
     .rpc("assign_item_to_cluster", { p_item_id: itemId });
 
@@ -863,6 +1026,14 @@ export async function enrichItem(
   }).eq("id", itemId);
 
   return { item_id: itemId, status: "done", cluster_id: clusterId as string | null };
+}
+
+/** 分割で作られた子（分類済み）かどうか */
+function isPreClassified(item: Record<string, unknown>): boolean {
+  return item.parent_item_id !== null &&
+    typeof item.summary === "string" &&
+    typeof item.priority === "string" &&
+    typeof item.category === "string";
 }
 
 /**

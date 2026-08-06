@@ -10,15 +10,35 @@ export interface NormalizedFeedback {
 export type SourceType = "slack" | "form" | "email";
 export type Priority = "urgent" | "high" | "medium" | "low";
 export type Category = "bug" | "feature_request" | "ux" | "other";
-export type Status = "new" | "reviewing" | "adopted" | "done" | "rejected" | "ignored";
+export type Status =
+  | "new" | "reviewing" | "adopted" | "done" | "rejected"
+  /** フィードバックではないと判定された */
+  | "ignored"
+  /** 論点ごとに分割された原文。一覧には出さず、子が実体になる */
+  | "split";
 
 export const PRIORITIES: Priority[] = ["urgent", "high", "medium", "low"];
 export const CATEGORIES: Category[] = ["bug", "feature_request", "ux", "other"];
+
+/** 分割後の 1 論点 */
+export interface ClassifiedIssue {
+  /** 原文から抜き出した該当箇所。取れなければ要約で代用する */
+  text: string;
+  summary: string;
+  priority: Priority;
+  category: Category;
+}
 
 export interface Classification {
   priority: Priority;
   category: Category;
   summary: string;
+  /**
+   * 論点ごとの分割結果。
+   * 1 件なら分割しない。2 件以上なら feedback_items を分けて作る。
+   * Dify が items を返さない場合は、上の priority/category/summary から 1 件を組み立てる。
+   */
+  issues: ClassifiedIssue[];
   /** フィードバックとして扱うべきか（Slack の雑談・通知を除くための判定） */
   is_feedback: boolean;
   /** is_feedback の確信度 0〜1。低いものはノイズ判定を採用しない */

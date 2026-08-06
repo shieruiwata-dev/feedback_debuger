@@ -266,10 +266,35 @@ done
      "is_feedback": true | false,
      "confidence": 0.0〜1.0,
      "noise_reason": "is_feedback が false のときだけ、その理由を日本語で 30 字以内",
-     "priority": "urgent" | "high" | "medium" | "low",
-     "category": "bug" | "feature_request" | "ux" | "other",
-     "summary": "日本語で 60 字以内の要約"
+     "issues": [
+       {
+         "text": "原文から該当箇所をそのまま抜き出す",
+         "summary": "その論点を日本語で 60 字以内に要約",
+         "priority": "urgent" | "high" | "medium" | "low",
+         "category": "bug" | "feature_request" | "ux" | "other"
+       }
+     ]
    }
+
+   issues の分け方（重要）:
+   1 つの投稿に複数の指摘が混ざっていることがあります。
+   「直すべき対象」が別々なら、別々の要素に分けてください。
+   - 分ける例:
+     「検索が遅い。あとCSV出力が欲しい。通知メールの文面も固い」
+     → 3 要素（bug / feature_request / ux）
+   - 分けない例:
+     「検索が遅い。特に商品名で検索したときが顕著で、5秒くらいかかる」
+     → 1 要素（同じ問題の詳述であって別の論点ではない）
+   迷ったら分けないでください。過剰な分割は件数を水増しし、
+   優先順位の判断を誤らせます。
+   論点が 1 つなら issues の要素も 1 つにしてください。
+
+   summary の書き方（重要）:
+   summary は「同じ内容の意見をまとめる」ための鍵になります。
+   投稿者ごとの言い回しの違いを消し、同じ問題なら同じ表現になるように書いてください。
+   - 「検索が遅くて待たされる」「検索結果がなかなか出ない」「商品検索が重い」
+     → いずれも「検索の応答が遅い」
+   敬語・前置き・感情表現は落とし、事象だけを書いてください。
 
    is_feedback の基準:
    このテキストは Slack チャンネルから拾ったもので、
@@ -331,6 +356,20 @@ curl -X POST https://api.dify.ai/v1/workflows/run \
 ```
 
 `data.outputs.result` に JSON が入っていれば OK。
+
+複数論点が分割されるかも確認しておく:
+
+```bash
+curl -X POST https://api.dify.ai/v1/workflows/run \
+  -H "Authorization: Bearer app-xxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": {"feedback_text":"検索が遅くて5秒くらい待たされます。あと申請履歴をCSVで出せると助かります。通知メールの文面も少し事務的すぎる気がします。","app_name":"マイサポ"},
+    "response_mode": "blocking",
+    "user": "setup-check"
+  }'
+# → issues が 3 要素（bug / feature_request / ux）で返ればよい
+```
 ノイズ側も確認しておく:
 
 ```bash
@@ -530,6 +569,7 @@ Lovable を外して Vercel / Netlify / Cloudflare Pages に載せ替えるこ�
 | `EMBEDDING_PROVIDER` | – | `openai` | `openai` / `dify_workflow` |
 | `OPENAI_API_KEY` | AI 有効時 | – | 埋め込み生成用 |
 | `EMBEDDING_MODEL` | – | `text-embedding-3-small` | – |
+| `EMBEDDING_SOURCE` | – | `summary` | ベクトル化の対象。`summary` / `raw_text` |
 | `EMBEDDING_DIMENSIONS` | – | `1536` | DB の `vector(N)` と一致させる |
 | `ENABLE_PREINSERT_NOISE_FILTER` | – | `true` | 層 0（insert 前の破棄）の有効/無効 |
 | `NOISE_MIN_LENGTH` | – | `6` | 装飾を除いた本文がこの文字数未満ならノイズ |

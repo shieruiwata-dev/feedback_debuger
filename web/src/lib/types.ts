@@ -1,7 +1,12 @@
 export type SourceType = "slack" | "form" | "email";
 export type Priority = "urgent" | "high" | "medium" | "low";
 export type Category = "bug" | "feature_request" | "ux" | "other";
-export type Status = "new" | "reviewing" | "adopted" | "done" | "rejected" | "ignored";
+export type Status =
+  | "new" | "reviewing" | "adopted" | "done" | "rejected"
+  /** フィードバックではないと判定された */
+  | "ignored"
+  /** 論点ごとに分割された原文。一覧には出さず、子が実体になる */
+  | "split";
 
 export interface App {
   id: string;
@@ -35,6 +40,10 @@ export interface FeedbackItem {
   created_at: string;
   /** null = 未判定 / false = ノイズ判定 */
   is_feedback: boolean | null;
+  /** 分割元の item。null なら分割されていない */
+  parent_item_id: string | null;
+  /** 分割元の中での通し番号（1 始まり） */
+  segment_index: number | null;
   /** 判定理由（ai:雑談のため / heuristic:too_short / marker:#fb など） */
   triage_reason: string | null;
   triage_confidence: number | null;
@@ -85,6 +94,7 @@ export const STATUS_LABEL: Record<Status, string> = {
   done: "完了",
   rejected: "見送り",
   ignored: "ノイズ",
+  split: "分割済み",
 };
 
 export const SOURCE_LABEL: Record<SourceType, string> = {

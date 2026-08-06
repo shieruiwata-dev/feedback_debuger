@@ -1,5 +1,12 @@
 import { env, envInt, requireEnv } from "./env.ts";
-import { CATEGORIES, type Category, type Classification, PRIORITIES, type Priority } from "./types.ts";
+import {
+  CATEGORIES,
+  type Category,
+  type Classification,
+  type ClassifiedIssue,
+  PRIORITIES,
+  type Priority,
+} from "./types.ts";
 
 const DEFAULT_BASE = "https://api.dify.ai/v1";
 
@@ -59,10 +66,14 @@ function normalizeClassification(
     obj = result as Record<string, unknown>;
   }
 
+  const issues = coerceIssues(obj["issues"] ?? obj["items"], obj, rawText);
+
   return {
-    priority: coerce(obj["priority"], PRIORITIES, "medium") as Priority,
-    category: coerce(obj["category"], CATEGORIES, "other") as Category,
-    summary: coerceSummary(obj["summary"], rawText),
+    // 分割しない場合の代表値。issues の先頭に揃えておく
+    priority: issues[0].priority,
+    category: issues[0].category,
+    summary: issues[0].summary,
+    issues,
     // is_feedback を返さない旧ワークフローとの互換のため、既定は true（取りこぼさない側に倒す）
     is_feedback: coerceBool(obj["is_feedback"] ?? obj["isFeedback"], true),
     confidence: coerceConfidence(obj["confidence"] ?? obj["is_feedback_confidence"]),
@@ -100,6 +111,64 @@ function coerceReason(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed.slice(0, 300) : null;
+}
+
+/**
+ * 論点の配列を組み立てる。
+ *
+ * 1 つの投稿に複数の指摘が混ざっている場合、Dify は issues に複数返してくる。
+ * issues を返さない（旧ワークフロー / 論点が 1 つ）の場合は、
+ * トップレベルの priority/category/summary から 1 件を組み立てて同じ形に揃える。
+ * こうしておくと、呼び出し側は「常に配列」として扱えて分岐が減る。
+ */
+function coerceIssues(
+  raw: unknown,
+  fallback: Record<string, unknown>,
+  rawText: string,
+): ClassifiedIssue[] {
+  const single = (): ClassifiedIssue[] => [{
+    text: rawText.trim(),
+    summary: coerceSummary(fallback["summary"], rawText),
+    priority: coerce(fallback["priority"], PRIORITIES, "medium") as Priority,
+    category: coerce(fallback["category"], CATEGORIES, "other") as Category,
+  }];
+
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === "string"
+    ? (() => {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    })()
+    : null;
+
+  if (!list || list.length === 0) return single();
+
+  const issues = list
+    .filter((v): v is Record<string, unknown> => typeof v === "object" && v !== null)
+    .map((v) => ({
+      // 原文の該当箇所。取れなければ要約で代用する（本文が空になるのを防ぐ）
+      text: coerceText(v["text"] ?? v["excerpt"] ?? v["quote"], v["summary"], rawText),
+      summary: coerceSummary(v["summary"], rawText),
+      priority: coerce(v["priority"], PRIORITIES, "medium") as Priority,
+      category: coerce(v["category"], CATEGORIES, "other") as Category,
+    }));
+
+  return issues.length > 0 ? issues : single();
+}
+
+function coerceText(value: unknown, summary: unknown, rawText: string): string {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim().slice(0, 5000);
+  }
+  if (typeof summary === "string" && summary.trim().length > 0) {
+    return summary.trim().slice(0, 5000);
+  }
+  return rawText.trim().slice(0, 5000);
 }
 
 /** LLM の出力ゆらぎ（大文字・前後空白・"feature request" 等）を吸収する */
