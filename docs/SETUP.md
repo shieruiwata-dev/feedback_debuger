@@ -68,7 +68,7 @@ from apps a left join feedback_sources s on s.app_id = a.id;
    - チャンネルで `/invite @フィードバックデバッガー`
    - **これを忘れるとイベントが飛んでこない**（一番よくあるハマりどころ）
 
-### デプロイ
+### デプロイ（方法 A: CLI）
 
 ```bash
 supabase secrets set \
@@ -77,6 +77,33 @@ supabase secrets set \
   ENABLE_AI_ENRICHMENT=false     # ← このステップでは AI 処理を止めておく
 
 supabase functions deploy slack-events --no-verify-jwt
+```
+
+### デプロイ（方法 B: ダッシュボードだけで済ませる）
+
+ローカルに CLI を入れずに進めたい場合はこちら。
+
+`supabase/functions/_bundled/` に、`_shared` を連結した**1 ファイル版**を置いてある。
+これをダッシュボードの Edge Functions エディタに貼り付ければデプロイできる。
+
+1. Dashboard → **Edge Functions** → **Deploy a new function** → **Via Editor**
+2. 関数名を `slack-events` にする（**この名前でないと Request URL が変わる**）
+3. エディタの中身を全消しし、`_bundled/slack-events.ts` の内容を貼り付ける
+4. **Verify JWT** を **OFF** にする（Slack は JWT を付けてこないため）
+5. Deploy
+6. Dashboard → Edge Functions → **Secrets** で環境変数を登録する
+
+1 ファイル版は自動生成物なので、直接編集しないこと。
+ロジックを変えたら `_shared` を直して再生成する:
+
+```bash
+node scripts/build-single-file-functions.mjs
+```
+
+分割版と同じ結合テストを 1 ファイル版に対しても流せる:
+
+```bash
+FN_BUNDLE_DIR=supabase/functions/_bundled deno test --allow-all supabase/functions/tests/
 ```
 
 ### 🔧 Event Subscriptions の設定（デプロイ後に行う）

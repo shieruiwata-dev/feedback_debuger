@@ -104,15 +104,32 @@ function startStub(recorded: Recorded[], opts: StubState = {}) {
   });
 }
 
+/**
+ * FN_BUNDLE_DIR を指定すると、_shared を連結した「1 ファイル版」を起動する。
+ * ダッシュボードに貼り付けて使う版が、分割版と同じ挙動になっているかを
+ * 同じテストで確認するためのスイッチ。
+ *   FN_BUNDLE_DIR=supabase/functions/_bundled deno test --allow-all ...
+ */
+function resolveEntrypoint(entrypoint: string): { path: string; useConfig: boolean } {
+  const bundleDir = Deno.env.get("FN_BUNDLE_DIR");
+  if (!bundleDir) {
+    return { path: new URL(entrypoint, import.meta.url).pathname, useConfig: true };
+  }
+  const name = entrypoint.replace("../", "").replace("/index.ts", "");
+  return { path: `${Deno.cwd()}/${bundleDir}/${name}.ts`, useConfig: false };
+}
+
 async function startFunction(entrypoint: string, env: Record<string, string> = {}) {
+  const resolved = resolveEntrypoint(entrypoint);
   const cmd = new Deno.Command(Deno.execPath(), {
     args: [
       "run",
       "--allow-net",
       "--allow-env",
-      "--config",
-      new URL("../deno.json", import.meta.url).pathname,
-      new URL(entrypoint, import.meta.url).pathname,
+      ...(resolved.useConfig
+        ? ["--config", new URL("../deno.json", import.meta.url).pathname]
+        : []),
+      resolved.path,
     ],
     env: {
       SUPABASE_URL: `http://localhost:${STUB_PORT}`,
