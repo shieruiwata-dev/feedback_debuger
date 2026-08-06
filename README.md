@@ -115,6 +115,8 @@ web/
 docs/
   SETUP.md                        # 手動設定チェックリスト（実装順序に対応）
   DECISIONS.md                    # 実装時の判断と、そう決めた理由
+  slack-app-manifest.json         # Slack アプリ設定（From a manifest で読み込む）
+  dify/feedback-classifier.yml    # Dify ワークフロー（DSL インポート用）
 ```
 
 ---

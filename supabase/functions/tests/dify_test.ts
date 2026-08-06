@@ -235,3 +235,76 @@ Deno.test("ノイズ判定は分割より優先される（issues があって�
   assertEquals(result.is_feedback, false);
   assertEquals(result.confidence, 0.9);
 });
+
+// =============================================================================
+// DSL のプロンプトとコードの契約
+//   docs/dify/feedback-classifier.yml が指示している出力形式を、
+//   こちら側のパーサが実際に読めることを確かめる。
+//   プロンプトを変えたときにここが落ちれば、取り違えに気づける。
+// =============================================================================
+Deno.test("契約: DSL が指示する形式（3 論点）をそのまま読める", () => {
+  // プロンプトの指示どおりに LLM が返してくる想定の文字列
+  const llmOutput = `{
+  "is_feedback": true,
+  "confidence": 0.95,
+  "noise_reason": null,
+  "issues": [
+    {
+      "text": "検索が遅くて5秒くらい待たされます",
+      "summary": "検索の応答が遅い",
+      "priority": "high",
+      "category": "bug"
+    },
+    {
+      "text": "申請履歴をCSVで出せると助かります",
+      "summary": "申請履歴のCSVエクスポート",
+      "priority": "medium",
+      "category": "feature_request"
+    },
+    {
+      "text": "通知メールの文面も少し事務的すぎる気がします",
+      "summary": "通知メールの文面が事務的",
+      "priority": "low",
+      "category": "ux"
+    }
+  ]
+}`;
+
+  const result = normalizeClassification({ result: llmOutput }, "原文");
+
+  assertEquals(result.is_feedback, true);
+  assertEquals(result.confidence, 0.95);
+  assertEquals(result.noise_reason, null);
+  assertEquals(result.issues.length, 3);
+  assertEquals(result.issues.map((i) => i.summary), [
+    "検索の応答が遅い",
+    "申請履歴のCSVエクスポート",
+    "通知メールの文面が事務的",
+  ]);
+  assertEquals(result.issues.map((i) => i.priority), ["high", "medium", "low"]);
+  assertEquals(result.issues.map((i) => i.category), ["bug", "feature_request", "ux"]);
+});
+
+Deno.test("契約: DSL が指示するノイズ形式を読める", () => {
+  const llmOutput = `{
+  "is_feedback": false,
+  "confidence": 0.92,
+  "noise_reason": "社内の予定調整の連絡",
+  "issues": [
+    {
+      "text": "明日の定例、15時からに変更でお願いします",
+      "summary": "定例の時間変更連絡",
+      "priority": "low",
+      "category": "other"
+    }
+  ]
+}`;
+
+  const result = normalizeClassification({ result: llmOutput }, "原文");
+
+  assertEquals(result.is_feedback, false);
+  assertEquals(result.confidence, 0.92);
+  assertEquals(result.noise_reason, "社内の予定調整の連絡");
+  // ノイズでも issues は 1 件。分割は走らない（enrich 側でトリアージが先に効く）
+  assertEquals(result.issues.length, 1);
+});

@@ -1,0 +1,265 @@
+app:
+  description: >-
+    フィードバックを「ノイズ判定 → 論点ごとの分割 → 優先度/カテゴリ/要約」まで
+    1 回の実行で行う。feedback-debugger の Edge Function から呼ばれる。
+  icon: 🐛
+  icon_background: '#FFEAD5'
+  mode: workflow
+  name: feedback-classifier
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+          - local_file
+          - remote_url
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+      - data:
+          isInIteration: false
+          sourceType: start
+          targetType: llm
+        id: start-source-classify-target
+        source: start
+        sourceHandle: source
+        target: classify
+        targetHandle: target
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: llm
+          targetType: end
+        id: classify-source-end-target
+        source: classify
+        sourceHandle: source
+        target: end
+        targetHandle: target
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: Edge Function から渡される入力
+          selected: false
+          title: 開始
+          type: start
+          variables:
+            - label: feedback_text
+              max_length: 8000
+              options: []
+              required: true
+              type: paragraph
+              variable: feedback_text
+            - label: app_name
+              max_length: 100
+              options: []
+              required: false
+              type: text-input
+              variable: app_name
+        height: 142
+        id: start
+        position:
+          x: 80
+          y: 282
+        positionAbsolute:
+          x: 80
+          y: 282
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          context:
+            enabled: false
+            variable_selector: []
+          desc: ノイズ判定・論点分割・分類をまとめて行う
+          model:
+            completion_params:
+              temperature: 0
+            mode: chat
+            name: gpt-4o-mini
+            provider: openai
+          prompt_template:
+            - id: system-prompt
+              role: system
+              text: >-
+                あなたは社内プロダクトのフィードバック分類器です。
+
+                与えられたテキストを読み、次の JSON だけを出力してください。
+
+                前後の説明文やコードフェンス（```）は書かないでください。
+
+
+                {
+                  "is_feedback": true または false,
+                  "confidence": 0.0〜1.0,
+                  "noise_reason": "is_feedback が false のときだけ、その理由を日本語で30字以内",
+                  "issues": [
+                    {
+                      "text": "原文から該当箇所をそのまま抜き出す",
+                      "summary": "その論点を日本語で60字以内に要約",
+                      "priority": "urgent" | "high" | "medium" | "low",
+                      "category": "bug" | "feature_request" | "ux" | "other"
+                    }
+                  ]
+                }
+
+
+                ■ is_feedback の基準
+
+                このテキストは Slack チャンネルから拾ったもので、
+
+                プロダクトへの意見以外（雑談・業務連絡・自動通知）も混ざっています。
+
+                - true:  プロダクトの不具合報告、要望、使いにくさの指摘、
+                         ユーザーからの声の共有（伝聞でも可）
+                - false: 日程調整・雑談・挨拶、デプロイやCIの自動通知、
+                         プロダクトと無関係な相談、社内の事務連絡
+
+                判断に迷う場合は true にし、confidence を 0.5 以下にしてください。
+
+                確信度が低いものは取りこぼしを避けるため残す設計になっています。
+
+                is_feedback が false のときも issues は 1 要素だけ入れてください。
+
+
+                ■ issues の分け方（重要）
+
+                1 つの投稿に複数の指摘が混ざっていることがあります。
+
+                「直すべき対象」が別々なら、別々の要素に分けてください。
+
+
+                分ける例:
+
+                「検索が遅い。あとCSV出力が欲しい。通知メールの文面も固い」
+
+                → 3 要素（bug / feature_request / ux）
+
+
+                分けない例:
+
+                「検索が遅い。特に商品名で検索したときが顕著で、5秒くらいかかる」
+
+                → 1 要素（同じ問題の詳述であって別の論点ではない）
+
+
+                迷ったら分けないでください。
+
+                過剰な分割は件数を水増しし、優先順位の判断を誤らせます。
+
+                論点が 1 つなら issues の要素も 1 つにしてください。
+
+
+                ■ summary の書き方（重要）
+
+                summary は「同じ内容の意見をまとめる」ための鍵になります。
+
+                この文をベクトル化して類似度でクラスタリングするため、
+
+                投稿者ごとの言い回しの違いを消し、同じ問題なら同じ表現になるように書いてください。
+
+
+                - 「検索が遅くて待たされる」「検索結果がなかなか出ない」「商品検索が重い」
+                  → いずれも「検索の応答が遅い」
+
+                敬語・前置き・感情表現・固有の状況説明は落とし、事象だけを書いてください。
+
+
+                ■ priority の基準
+
+                - urgent: 業務が停止する / データが失われる / 全ユーザーに影響
+
+                - high:   主要機能が使えない、回避策が面倒
+
+                - medium: 不便だが回避策がある
+
+                - low:    軽微な指摘、感想
+
+
+                ■ category の基準
+
+                - bug:             期待どおり動かない
+
+                - feature_request: 新しい機能や項目の要望
+
+                - ux:              動くが分かりにくい・使いにくい
+
+                - other:           上記に当てはまらないもの
+            - id: user-prompt
+              role: user
+              text: >-
+                対象アプリ: {{#start.app_name#}}
+
+
+                テキスト:
+
+                {{#start.feedback_text#}}
+          selected: false
+          title: 分類
+          type: llm
+          variables: []
+          vision:
+            enabled: false
+        height: 98
+        id: classify
+        position:
+          x: 384
+          y: 282
+        positionAbsolute:
+          x: 384
+          y: 282
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: Edge Function は data.outputs.result を読む
+          outputs:
+            - value_selector:
+                - classify
+                - text
+              variable: result
+          selected: false
+          title: 終了
+          type: end
+        height: 90
+        id: end
+        position:
+          x: 688
+          y: 282
+        positionAbsolute:
+          x: 688
+          y: 282
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.8
