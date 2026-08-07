@@ -24,6 +24,12 @@ const DEFAULT_BASE = "https://api.dify.ai/v1";
 export async function classifyWithDify(
   rawText: string,
   appName: string,
+  /**
+   * 既存クラスタの候補一覧（番号付きテキスト）。
+   * CLUSTERING_STRATEGY=llm のときに渡す。埋め込み方式のときは空文字で、
+   * ワークフロー側は「該当なし」として match: null を返す。
+   */
+  existingIssues = "",
 ): Promise<Classification> {
   const baseUrl = env("DIFY_API_BASE_URL") ?? DEFAULT_BASE;
   const apiKey = requireEnv("DIFY_CLASSIFY_API_KEY");
@@ -36,7 +42,11 @@ export async function classifyWithDify(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      inputs: { feedback_text: rawText.slice(0, 8000), app_name: appName },
+      inputs: {
+        feedback_text: rawText.slice(0, 8000),
+        app_name: appName,
+        existing_issues: existingIssues.slice(0, 8000),
+      },
       response_mode: "blocking",
       user: "feedback-debugger",
     }),
@@ -131,6 +141,7 @@ function coerceIssues(
     summary: coerceSummary(fallback["summary"], rawText),
     priority: coerce(fallback["priority"], PRIORITIES, "medium") as Priority,
     category: coerce(fallback["category"], CATEGORIES, "other") as Category,
+    match: coerceMatch(fallback["match"] ?? fallback["match_id"]),
   }];
 
   const list = Array.isArray(raw)
@@ -156,9 +167,29 @@ function coerceIssues(
       summary: coerceSummary(v["summary"], rawText),
       priority: coerce(v["priority"], PRIORITIES, "medium") as Priority,
       category: coerce(v["category"], CATEGORIES, "other") as Category,
+      match: coerceMatch(v["match"] ?? v["match_id"] ?? v["existing"]),
     }));
 
   return issues.length > 0 ? issues : single();
+}
+
+/**
+ * 既存論点との一致番号。
+ * LLM は null / "null" / 0 / "3" などを混ぜて返してくるので正規化する。
+ * 数値として読めないものは「該当なし」に倒す（誤った合流は気づきにくいため）。
+ */
+function coerceMatch(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (trimmed === "" || trimmed === "null" || trimmed === "none" || trimmed === "なし") {
+      return null;
+    }
+    const n = Number.parseInt(trimmed, 10);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  return null;
 }
 
 function coerceText(value: unknown, summary: unknown, rawText: string): string {

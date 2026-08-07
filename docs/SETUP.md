@@ -411,36 +411,73 @@ curl -X POST https://api.dify.ai/v1/workflows/run \
 
 ---
 
-## Step 6. 埋め込みベクトルの生成
+## Step 6. クラスタリング方式を選ぶ
 
-Dify には任意テキストをベクトル化する汎用 API が無いため、
-**埋め込みだけは OpenAI の embeddings API を直接呼ぶ**（理由は [DECISIONS.md](DECISIONS.md) 参照）。
+「言い回しが違っても同じ内容ならまとめる」をどう実現するか、2 通りある。
 
-### 🔧 手動設定
+| 方式 | 必要なもの | Dify 呼び出し | 備考 |
+|---|---|---|---|
+| **llm**（既定） | Dify だけ | 1 投稿につき 1 回 | 既存クラスタの要約一覧を LLM に見せて判断させる |
+| embedding | + OpenAI API キー | 1 回 + 埋め込み API | 要約をベクトル化し pgvector の最近傍で決める |
 
-1. https://platform.openai.com/api-keys で API キーを発行する
-2. 課金設定（支払い方法）を有効にする。無料枠のままだと 429 が返る
+`CLUSTERING_STRATEGY` 未設定なら、`OPENAI_API_KEY` の有無で自動判定する
+（あれば embedding、無ければ llm）。設定漏れで黙って止まるより動く方に倒してある。
 
-### デプロイ
+### 方式 A: llm（埋め込み API 不要）
 
 ```bash
 supabase secrets set \
+  CLUSTERING_STRATEGY=llm \
+  DIFY_CLASSIFY_API_KEY=app-xxxxxxxxxxxx \
+  ENABLE_AI_ENRICHMENT=true
+```
+
+仕組み:
+
+1. 新しい投稿が来たら、Postgres が既存クラスタから候補を絞る（`candidate_clusters()`）
+   - 文字列が近いもの（pg_trgm）と、件数が多いものの両方から拾う
+   - 語が重ならない同義の論点を落とさないための二本立て
+2. 候補を番号つきで Dify のプロンプトに載せる（**分類と同じ 1 回の呼び出し**）
+3. LLM が論点ごとに「既存の何番と同じか / 該当なし」を返す
+4. 番号を cluster_id に戻して合流、該当なしなら新規クラスタ
+
+候補の上限は `LLM_CLUSTER_CANDIDATES`（既定 40）。
+クラスタが増えてきて取りこぼす感触があれば増やす。プロンプトが膨らむのと引き換え。
+
+> **Dify のワークフローを更新すること。** `existing_issues` 入力変数と突き合わせの指示が
+> 必要なので、`docs/dify/feedback-classifier.yml` を再インポートする。
+
+### 方式 B: embedding（OpenAI API キーが要る）
+
+```bash
+supabase secrets set \
+  CLUSTERING_STRATEGY=embedding \
   OPENAI_API_KEY=sk-... \
   EMBEDDING_MODEL=text-embedding-3-small \
-  EMBEDDING_DIMENSIONS=1536
-
-# ここで AI 処理を有効化する（Step 5〜8 がまとめて動き出す）
-supabase secrets set ENABLE_AI_ENRICHMENT=true
-
-supabase functions deploy slack-events   --no-verify-jwt
-supabase functions deploy submit-feedback --no-verify-jwt
-supabase functions deploy process-feedback
+  EMBEDDING_DIMENSIONS=1536 \
+  EMBEDDING_SOURCE=summary \
+  ENABLE_AI_ENRICHMENT=true
 ```
+
+🔧 事前に https://platform.openai.com/api-keys でキーを発行し、課金設定を有効にする
+（無料枠のままだと 429 が返る）。
 
 > **モデルを変える場合**: 次元数が変わるなら `feedback_items.embedding` と
 > `feedback_clusters.representative_embedding` の `vector(N)` も合わせて変更し、
 > 既存の埋め込みは作り直しになる。`EMBEDDING_DIMENSIONS` と列定義がズレていると
 > Edge Function 側が明示的にエラーを出すようにしてある。
+
+### 関数の再デプロイ
+
+どちらの方式でも、コードを更新したら貼り直しが必要。
+
+```bash
+supabase functions deploy slack-events   --no-verify-jwt
+supabase functions deploy submit-feedback --no-verify-jwt
+supabase functions deploy process-feedback
+```
+
+ダッシュボード運用なら `supabase/functions/_bundled/*.ts` を貼り直す。
 
 ### 既存データの遡り処理
 
@@ -460,13 +497,15 @@ curl -X POST "https://<project-ref>.supabase.co/functions/v1/process-feedback" \
 ### 確認
 
 ```sql
-select id, priority, category, summary,
-       (embedding is not null) as has_embedding,
-       processing_state, processing_error
-from feedback_items order by created_at desc limit 10;
+select i.segment_index, i.priority, i.category, i.summary,
+       c.representative_summary, c.item_count, c.score
+from feedback_items i
+left join feedback_clusters c on c.id = i.cluster_id
+where i.status <> 'split'
+order by i.created_at desc limit 10;
 ```
 
----
+同じ内容を違う言い回しで 2 回投稿し、`item_count` と `score` が上がれば成立している。
 
 ## Step 7-8. クラスタリングと採用スコア
 

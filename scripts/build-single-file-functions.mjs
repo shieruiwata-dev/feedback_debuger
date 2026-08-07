@@ -33,6 +33,7 @@ const SHARED_ORDER = [
   "embeddings.ts",
   "supabase.ts",
   "triage.ts",
+  "clustering.ts",
   "slack.ts",
   "spam.ts",
   "enrich.ts",
@@ -41,9 +42,9 @@ const SHARED_ORDER = [
 
 /** 関数ごとに必要な _shared モジュール（未使用のコードを混ぜないため明示する） */
 const FUNCTIONS = {
-  "slack-events": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "slack", "enrich", "ingest"],
-  "submit-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "spam", "enrich", "ingest"],
-  "process-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "enrich"],
+  "slack-events": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "slack", "enrich", "ingest"],
+  "submit-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "spam", "enrich", "ingest"],
+  "process-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "enrich"],
 };
 
 const SUPABASE_IMPORT =

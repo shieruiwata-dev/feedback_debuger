@@ -27,6 +27,11 @@ export interface ClassifiedIssue {
   summary: string;
   priority: Priority;
   category: Category;
+  /**
+   * 既存クラスタの候補一覧のうち、同じ論点だと LLM が判断した番号（1 始まり）。
+   * 該当なしなら null。CLUSTERING_STRATEGY=llm のときだけ使う。
+   */
+  match: number | null;
 }
 
 export interface Classification {

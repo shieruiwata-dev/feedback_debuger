@@ -81,6 +81,11 @@ export interface ClassifiedIssue {
   summary: string;
   priority: Priority;
   category: Category;
+  /**
+   * 既存クラスタの候補一覧のうち、同じ論点だと LLM が判断した番号（1 始まり）。
+   * 該当なしなら null。CLUSTERING_STRATEGY=llm のときだけ使う。
+   */
+  match: number | null;
 }
 
 export interface Classification {
@@ -195,6 +200,12 @@ const DEFAULT_BASE = "https://api.dify.ai/v1";
 export async function classifyWithDify(
   rawText: string,
   appName: string,
+  /**
+   * 既存クラスタの候補一覧（番号付きテキスト）。
+   * CLUSTERING_STRATEGY=llm のときに渡す。埋め込み方式のときは空文字で、
+   * ワークフロー側は「該当なし」として match: null を返す。
+   */
+  existingIssues = "",
 ): Promise<Classification> {
   const baseUrl = env("DIFY_API_BASE_URL") ?? DEFAULT_BASE;
   const apiKey = requireEnv("DIFY_CLASSIFY_API_KEY");
@@ -207,7 +218,11 @@ export async function classifyWithDify(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      inputs: { feedback_text: rawText.slice(0, 8000), app_name: appName },
+      inputs: {
+        feedback_text: rawText.slice(0, 8000),
+        app_name: appName,
+        existing_issues: existingIssues.slice(0, 8000),
+      },
       response_mode: "blocking",
       user: "feedback-debugger",
     }),
@@ -302,6 +317,7 @@ function coerceIssues(
     summary: coerceSummary(fallback["summary"], rawText),
     priority: coerce(fallback["priority"], PRIORITIES, "medium") as Priority,
     category: coerce(fallback["category"], CATEGORIES, "other") as Category,
+    match: coerceMatch(fallback["match"] ?? fallback["match_id"]),
   }];
 
   const list = Array.isArray(raw)
@@ -327,9 +343,29 @@ function coerceIssues(
       summary: coerceSummary(v["summary"], rawText),
       priority: coerce(v["priority"], PRIORITIES, "medium") as Priority,
       category: coerce(v["category"], CATEGORIES, "other") as Category,
+      match: coerceMatch(v["match"] ?? v["match_id"] ?? v["existing"]),
     }));
 
   return issues.length > 0 ? issues : single();
+}
+
+/**
+ * 既存論点との一致番号。
+ * LLM は null / "null" / 0 / "3" などを混ぜて返してくるので正規化する。
+ * 数値として読めないものは「該当なし」に倒す（誤った合流は気づきにくいため）。
+ */
+function coerceMatch(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (trimmed === "" || trimmed === "null" || trimmed === "none" || trimmed === "なし") {
+      return null;
+    }
+    const n = Number.parseInt(trimmed, 10);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }
+  return null;
 }
 
 function coerceText(value: unknown, summary: unknown, rawText: string): string {
@@ -706,6 +742,95 @@ export function minTriageConfidence(fallback = 0.7): number {
 }
 
 // ===========================================================================
+// _shared/clustering.ts
+// ===========================================================================
+/**
+ * クラスタリング方式の切り替え。
+ *
+ *   embedding … 要約をベクトル化し、pgvector の最近傍で合流先を決める（従来）
+ *   llm       … 既存クラスタの要約一覧を LLM に見せて、同じ論点かを判断させる
+ *
+ * llm 方式は埋め込み API を持たない環境（Dify だけで完結させたい場合）向け。
+ * 照合は分類と同じ Dify 呼び出しに同居させるので、API 呼び出し回数は増えない。
+ *
+ * 既定は、埋め込みの鍵があれば embedding、無ければ llm。
+ * 設定漏れで黙って壊れるより、動く方に倒す。
+ */
+export type ClusteringStrategy = "embedding" | "llm";
+
+export function clusteringStrategy(): ClusteringStrategy {
+  const explicit = env("CLUSTERING_STRATEGY");
+  if (explicit === "embedding" || explicit === "llm") return explicit;
+  return env("OPENAI_API_KEY") ? "embedding" : "llm";
+}
+
+export interface CandidateCluster {
+  cluster_id: string;
+  summary: string;
+  item_count: number;
+}
+
+/**
+ * LLM に突き合わせさせる既存クラスタを取ってくる。
+ * 全件を渡すとクラスタが増えるほどプロンプトが膨らむので、Postgres 側で絞る。
+ */
+export async function fetchCandidates(
+  db: SupabaseClient,
+  appId: string,
+  query: string,
+): Promise<CandidateCluster[]> {
+  const { data, error } = await db.rpc("candidate_clusters", {
+    p_app_id: appId,
+    p_query: query.slice(0, 500),
+    p_limit: envInt("LLM_CLUSTER_CANDIDATES", 40),
+  });
+
+  if (error) {
+    // 候補が取れなくても取り込みは続ける。全部が新規クラスタになるだけで、データは失わない
+    console.error("candidate_clusters failed, continuing without candidates:", error.message);
+    return [];
+  }
+
+  return (data ?? []) as CandidateCluster[];
+}
+
+/**
+ * 候補を LLM に渡すテキストにする。
+ *
+ *   1. 検索の応答が遅い（12件）
+ *   2. 申請履歴のCSVエクスポート（8件）
+ *
+ * 番号で答えさせるのは、UUID を書き写させると誤りが混ざるため。
+ * 件数を添えるのは、大きなクラスタへの合流を選びやすくする手がかりになるため。
+ */
+export function formatCandidates(candidates: CandidateCluster[]): string {
+  if (candidates.length === 0) return "（まだ登録された論点はありません）";
+
+  return candidates
+    .map((c, i) => `${i + 1}. ${c.summary}（${c.item_count}件）`)
+    .join("\n");
+}
+
+/**
+ * LLM が返した番号を cluster_id に戻す。
+ *
+ * 範囲外の番号や欠番は「該当なし」として扱う。
+ * 存在しないクラスタに紐付けるより、新規クラスタを作る方が実害が小さい
+ * （後から人手で束ねられるが、誤った合流は気づきにくい）。
+ */
+export function resolveMatch(
+  match: number | null,
+  candidates: CandidateCluster[],
+): string | null {
+  if (match === null || !Number.isInteger(match)) return null;
+  if (match < 1 || match > candidates.length) {
+    console.warn(`llm returned out-of-range match: ${match} (candidates=${candidates.length})`);
+    return null;
+  }
+  return candidates[match - 1].cluster_id;
+}
+
+// ===========================================================================
 // _shared/spam.ts
 // ===========================================================================
 /**
@@ -866,8 +991,18 @@ export async function enrichItem(
 
   const rawText = item.raw_text as string;
 
-  // 分割で生まれた子は分類済み。ここを飛ばして埋め込み → クラスタリングへ直行する
+  // 分割で生まれた子は分類済み。ここを飛ばしてクラスタリングへ直行する。
+  // llm 方式の子は親の処理内で既にクラスタへ載っているので、再処理で来た分だけがここに来る。
   if (isPreClassified(item)) {
+    if (clusteringStrategy() === "llm") {
+      return await matchAndCluster(
+        db,
+        itemId,
+        item.app_id as string,
+        item.summary as string,
+        (item.priority as string) ?? "",
+      );
+    }
     return await embedAndCluster(db, itemId, rawText, item.summary as string | null);
   }
 
@@ -876,10 +1011,20 @@ export async function enrichItem(
   // 明示マーク済み（#fb / 📮 リアクション / 人手で復帰）は AI 判定で落とさない
   const forced = item.is_feedback === true;
 
-  // --- 1. 分類 -------------------------------------------------------------
+  // --- 1. 分類（llm 方式では既存クラスタとの突き合わせも同じ呼び出しで行う）----
+  const strategy = clusteringStrategy();
+  let candidates: CandidateCluster[] = [];
+  if (strategy === "llm") {
+    candidates = await fetchCandidates(db, item.app_id as string, rawText);
+  }
+
   let classification;
   try {
-    classification = await classifyWithDify(rawText, appName);
+    classification = await classifyWithDify(
+      rawText,
+      appName,
+      strategy === "llm" ? formatCandidates(candidates) : "",
+    );
   } catch (err) {
     return await markFailed(db, itemId, `classify: ${errorMessage(err)}`);
   }
@@ -913,7 +1058,7 @@ export async function enrichItem(
 
   // --- 3. 論点が複数あれば分割 ---------------------------------------------
   if (classification.issues.length > 1) {
-    return await splitAndEnrich(db, itemId, classification.issues);
+    return await splitAndEnrich(db, itemId, classification.issues, candidates);
   }
 
   // --- 4-5. 単一論点はその場で仕上げる -------------------------------------
@@ -938,6 +1083,11 @@ export async function enrichItem(
     return await markFailed(db, itemId, `update: ${updateError.message}`);
   }
 
+  if (strategy === "llm") {
+    const clusterId = resolveMatch(classification.issues[0].match, candidates);
+    return await attachAndFinish(db, itemId, clusterId);
+  }
+
   return await embedAndCluster(db, itemId, rawText, classification.summary);
 }
 
@@ -949,6 +1099,7 @@ async function splitAndEnrich(
   db: SupabaseClient,
   parentId: string,
   issues: ClassifiedIssue[],
+  candidates: CandidateCluster[],
 ): Promise<EnrichResult> {
   const { data: children, error } = await db.rpc("split_feedback_item", {
     p_parent_id: parentId,
@@ -967,9 +1118,16 @@ async function splitAndEnrich(
 
   // 子はクラスタリングまで進める。1 件失敗しても他は続行する
   // （失敗した子は processing_state='failed' で残り、再処理バッチが拾う）
-  for (const child of rows) {
+  const strategy = clusteringStrategy();
+  for (const [i, child] of rows.entries()) {
     try {
-      await enrichItem(db, child.id);
+      if (strategy === "llm") {
+        // 親の 1 回の分類で得た突き合わせ結果をそのまま使う。子ごとに Dify を呼び直さない
+        const clusterId = resolveMatch(issues[i]?.match ?? null, candidates);
+        await attachAndFinish(db, child.id, clusterId);
+      } else {
+        await enrichItem(db, child.id);
+      }
     } catch (err) {
       console.error(`child ${child.id} enrichment failed:`, err);
     }
@@ -1026,6 +1184,58 @@ async function embedAndCluster(
   }).eq("id", itemId);
 
   return { item_id: itemId, status: "done", cluster_id: clusterId as string | null };
+}
+
+/**
+ * 再処理で来た「分類済みだがクラスタ未割り当て」の item を、
+ * 既存クラスタと突き合わせて載せる（llm 方式）。
+ * 分類はやり直さず、突き合わせだけを Dify に聞く。
+ */
+async function matchAndCluster(
+  db: SupabaseClient,
+  itemId: string,
+  appId: string,
+  summary: string,
+  _priority: string,
+): Promise<EnrichResult> {
+  const candidates = await fetchCandidates(db, appId, summary);
+
+  // 候補が無ければ問い合わせるまでもなく新規クラスタ
+  if (candidates.length === 0) {
+    return await attachAndFinish(db, itemId, null);
+  }
+
+  let match: number | null = null;
+  try {
+    const result = await classifyWithDify(summary, "", formatCandidates(candidates));
+    match = result.issues[0]?.match ?? null;
+  } catch (err) {
+    return await markFailed(db, itemId, `match: ${errorMessage(err)}`);
+  }
+
+  return await attachAndFinish(db, itemId, resolveMatch(match, candidates));
+}
+
+/** クラスタに載せて処理済みにする（埋め込みを使わない経路） */
+async function attachAndFinish(
+  db: SupabaseClient,
+  itemId: string,
+  clusterId: string | null,
+): Promise<EnrichResult> {
+  const { data, error } = await db.rpc("attach_item_to_cluster", {
+    p_item_id: itemId,
+    p_cluster_id: clusterId,
+  });
+
+  if (error) return await markFailed(db, itemId, `cluster: ${error.message}`);
+
+  await db.from("feedback_items").update({
+    processing_state: "done",
+    processing_error: null,
+    processed_at: new Date().toISOString(),
+  }).eq("id", itemId);
+
+  return { item_id: itemId, status: "done", cluster_id: data as string | null };
 }
 
 /** 分割で作られた子（分類済み）かどうか */

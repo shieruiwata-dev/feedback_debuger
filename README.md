@@ -4,7 +4,7 @@
 AI で分類・類似度クラスタリングして「どの意見が多く支持されているか」をスコア化して確認するための社内ツール。
 
 - **DB / API**: Supabase（Postgres + pgvector + Edge Functions）
-- **AI**: Dify（分類）+ OpenAI Embeddings（ベクトル生成）
+- **AI**: Dify（分類・論点分割・クラスタ照合）。埋め込み API は任意
 - **フロント**: React + `@supabase/supabase-js`（Lovable にデプロイ）
 
 ---
@@ -17,6 +17,7 @@ AI で分類・類似度クラスタリングして「どの意見が多く支�
 - [セットアップ](#セットアップ)
 - [フィードバック選別（ノイズ除去）](#フィードバック選別ノイズ除去)
 - [長文の分割（1 論点 = 1 件）](#長文の分割1-論点--1-件)
+- [クラスタリングの方式](#クラスタリングの方式)
 - [採用スコアの算出方法](#採用スコアの算出方法)
 - [クラスタリングの挙動](#クラスタリングの挙動)
 - [チューニング](#チューニング)
@@ -100,6 +101,7 @@ supabase/
     20260805000500_triage.sql     # ノイズ選別（ignored ステータス・復帰 RPC）
     20260805000600_update_slack_channel.sql
     20260805000700_split_items.sql # 長文の分割（親子関係・split/unsplit RPC）
+    20260805000800_llm_clustering.sql # 埋め込みを使わない照合（候補抽出・割り当て RPC）
   functions/
     _shared/                      # 全アダプタ共通の処理（triage.ts に選別ロジック）
     slack-events/                 # Slack 取り込みアダプタ
@@ -287,6 +289,47 @@ where status = 'split';
 
 ---
 
+## クラスタリングの方式
+
+「言い回しが違っても同じ内容ならまとめる」の実現方法が 2 通りある。
+`CLUSTERING_STRATEGY` で切り替える。
+
+| | `llm`（既定） | `embedding` |
+|---|---|---|
+| 必要なもの | Dify だけ | + 埋め込み API（OpenAI 等） |
+| 判断のしかた | 既存クラスタの要約一覧を LLM に見せて選ばせる | 要約をベクトル化して pgvector で最近傍を探す |
+| API 呼び出し | 1 投稿につき 1 回（分類と同居） | 1 回 + 埋め込み API |
+| 得意なこと | 「同じ対象・同じ問題か」を文脈で判断できる | クラスタが数千に増えても速度が落ちない |
+| 苦手なこと | クラスタが増えるとプロンプトが膨らむ | 語義が近いだけの別問題を誤って合流しやすい |
+
+未設定なら `OPENAI_API_KEY` の有無で自動判定する（あれば embedding、無ければ llm）。
+
+### llm 方式の流れ
+
+```
+新しい投稿
+  ↓ Postgres が候補クラスタを絞る（candidate_clusters）
+     ・文字列が近いもの（pg_trgm）
+     ・件数が多いもの        ← 語が重ならない同義の論点を落とさないための二本立て
+  ↓ 候補を番号つきでプロンプトに載せ、分類と同じ 1 回の Dify 呼び出しに同居させる
+  ↓ LLM が論点ごとに「既存の何番と同じか / 該当なし」を返す
+  ↓ 番号を cluster_id に戻して合流。該当なしなら新規クラスタ
+```
+
+安全側の倒し方:
+
+- **範囲外の番号や読めない値は「該当なし」**として新規クラスタにする。
+  存在しないクラスタに紐付けるより実害が小さい（誤った合流は気づきにくい）
+- **他アプリのクラスタ番号は無視する**。`attach_item_to_cluster()` が app_id を照合する
+- 候補取得に失敗しても取り込みは続く。全部が新規クラスタになるだけでデータは失わない
+
+```sql
+-- 候補の上限を変える（既定 40）。増やすと取りこぼしが減るがプロンプトが膨らむ
+-- supabase secrets set LLM_CLUSTER_CANDIDATES=60
+```
+
+---
+
 ## 採用スコアの算出方法
 
 ```
@@ -350,7 +393,7 @@ where key = 'scoring.priority_weights';
 
 ```bash
 # Edge Function（署名検証・Dify 出力の正規化・ノイズ選別・アダプタの結合テスト）
-deno test --allow-all supabase/functions/tests/
+deno test --config supabase/functions/deno.json --allow-all supabase/functions/tests/
 
 # DB（クラスタリング・スコアリング・RLS）
 supabase start
@@ -362,6 +405,8 @@ psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/triage_test.sql
 psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
   -v ON_ERROR_STOP=1 -f supabase/tests/split_test.sql
+psql "$(supabase status -o env | grep DB_URL | cut -d= -f2-)" \
+  -v ON_ERROR_STOP=1 -f supabase/tests/llm_clustering_test.sql
 
 # フロント
 cd web && npm run build
@@ -417,5 +462,8 @@ SQL テストは末尾で `rollback` するのでデータは残らない。
   ダッシュボードからは操作できない。
 - **要約を埋め込むため、要約が外すとクラスタリングも外す。**
   Dify が論点を取り違えた場合、原文が似ていても別クラスタに入る。
-- **埋め込みは OpenAI に直接投げている。** Dify に汎用の embeddings API が無いため
-  （詳細は [docs/DECISIONS.md](docs/DECISIONS.md)）。AI 関連の課金経路が Dify と OpenAI の 2 つになる。
+- **llm 方式はクラスタ数に対してスケールしない。** 候補を 40 件に絞ってプロンプトに載せるため、
+  クラスタが数百を超えると「候補に入らなかった正解」が出てくる。
+  その段階まで来たら embedding 方式（要 OpenAI キー）に切り替えるのが素直。
+- **llm 方式の合流は実行のたびに揺れうる。** 同じ入力でも LLM が別の判断をすることがある
+  （temperature 0 でも完全な決定性は保証されない）。埋め込みの距離計算のような再現性は無い。
