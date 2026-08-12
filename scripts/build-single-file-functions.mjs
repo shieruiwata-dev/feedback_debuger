@@ -38,6 +38,8 @@ const SHARED_ORDER = [
   "spam.ts",
   "enrich.ts",
   "ingest.ts",
+  "notion.ts",
+  "notionsync.ts",
 ];
 
 /** 関数ごとに必要な _shared モジュール（未使用のコードを混ぜないため明示する） */
@@ -45,6 +47,7 @@ const FUNCTIONS = {
   "slack-events": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "slack", "enrich", "ingest"],
   "submit-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "spam", "enrich", "ingest"],
   "process-feedback": ["env", "types", "http", "dify", "embeddings", "supabase", "triage", "clustering", "enrich"],
+  "notion-sync": ["env", "types", "http", "supabase", "notion", "notionsync"],
 };
 
 const SUPABASE_IMPORT =

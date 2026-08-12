@@ -85,6 +85,7 @@ Slack チャンネルにはフィードバック以外の投稿も流れてく�
 | `slack-events` | 無効 | Slack Events API の受信口（署名検証で保護） |
 | `submit-feedback` | 無効 | フォームの受信口（レートリミット + ハニーポットで保護） |
 | `process-feedback` | 有効 | 分類・トリアージ・埋め込み・クラスタリングの実行 / 再実行 / 再スコアリング |
+| `notion-sync` | 有効 | 集計結果を Notion のデータベースへ書き出す |
 
 ---
 
@@ -102,11 +103,13 @@ supabase/
     20260805000600_update_slack_channel.sql
     20260805000700_split_items.sql # 長文の分割（親子関係・split/unsplit RPC）
     20260805000800_llm_clustering.sql # 埋め込みを使わない照合（候補抽出・割り当て RPC）
+    20260805000900_notion_sync.sql # Notion への書き出し（差分検出・同期記録）
   functions/
     _shared/                      # 全アダプタ共通の処理（triage.ts に選別ロジック）
     slack-events/                 # Slack 取り込みアダプタ
     submit-feedback/              # フォーム取り込みアダプタ
     process-feedback/             # エンリッチメント実行 / 再実行
+    notion-sync/                  # Notion への書き出し
     tests/                        # deno test
   tests/                          # psql で流す SQL テスト
 web/
@@ -116,10 +119,22 @@ web/
   src/components/NoiseList.tsx       # ノイズ判定欄（誤判定の復帰）
 docs/
   SETUP.md                        # 手動設定チェックリスト（実装順序に対応）
+  NOTION.md                       # Notion へ結果を書き出す手順
   DECISIONS.md                    # 実装時の判断と、そう決めた理由
   slack-app-manifest.json         # Slack アプリ設定（From a manifest で読み込む）
   dify/feedback-classifier.yml    # Dify ワークフロー（DSL インポート用）
+  dify/system-prompt.txt          # 上記の system プロンプトだけを抜いたもの（貼り替え用）
 ```
+
+### 結果をどこで見るか
+
+2 通りある。**どちらか一方でよい。**
+
+- **Notion**（推奨） … 論点を Notion のデータベースに書き出す。
+  チームが既にタスク管理で使っているならこちら。手順は
+  **[docs/NOTION.md](docs/NOTION.md)**
+- **専用ダッシュボード** … `web/` の React アプリを Lovable 等に載せる。
+  ノイズ判定の復帰画面など、Notion では作れない操作が必要な場合はこちら
 
 ---
 

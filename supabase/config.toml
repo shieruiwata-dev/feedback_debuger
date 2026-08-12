@@ -38,3 +38,6 @@ verify_jwt = false
 
 [functions.process-feedback]
 verify_jwt = true
+
+[functions.notion-sync]
+verify_jwt = true
